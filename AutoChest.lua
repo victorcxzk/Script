@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.1)
+    AUTO CHEST & SERVER HOP (v2.7.2)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,8 +27,8 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.1"
-local SCRIPT_BUILD = "2026-10-06 / sea2-hop-and-travel"
+local SCRIPT_VERSION = "2.7.2"
+local SCRIPT_BUILD = "2026-10-06 / hop-http-fallback-and-fast-approach"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
@@ -68,11 +68,11 @@ local Config = {
     MinimumChestAnchors = 3,        -- Evita Hop enquanto o mapa ainda esta incompleto
 
     TweenSpeed = IS_SEA_2 and 215 or 180, -- Sea 2 recebe cruzeiro maior; Sea 1/3 ficam conservadoras
-    VerticalSpeed = IS_SEA_2 and 95 or 80,   -- Sobe/desce mais rapido sem alterar a velocidade de contato
+    VerticalSpeed = IS_SEA_2 and 95 or 80,   -- Subida/descida de viagem
     MovementTimeout = 90,           -- Prazo por trecho; viagens longas sao divididas em trechos
-    FinalApproachDistance = 55,     -- Alvos proximos nao fazem a rota alta completa
-    FinalApproachSpeed = IS_SEA_2 and 68 or 55, -- Acelera apenas aproximacao/descida, nao o toque no bau
-    ContactSpeed = 14,              -- Velocidade ao entrar no hitbox do bau
+    FinalApproachDistance = 25,     -- Só abandona a rota alta quando o bau ja esta realmente perto
+    FinalApproachSpeed = IS_SEA_2 and 150 or 125, -- Mantem velocidade alta ate quase encostar no bau
+    ContactSpeed = IS_SEA_2 and 48 or 42, -- Apenas o ultimo contato fica controlado, sem a antiga "freada"
     ArrivalTolerance = 5,           -- Distancia maxima para considerar que chegou ao bau
 
     Noclip = true,                  -- Atravessa paredes durante o deslocamento
@@ -90,7 +90,7 @@ local Config = {
     AutoReconnect = true,           -- Reconecta automaticamente se perder conexao
     PersistOnTeleport = true,       -- Injeta o script para auto-executar no proximo servidor via queue_on_teleport
     HopTimeout = 20,                -- Troca de alvo se o loading nao terminar
-    MaxHopAttempts = 3,             -- Evita retries infinitos de teleporte
+    MaxHopAttempts = 5,             -- Tolera falhas transitorias da API/teleporte antes de bloquear
     GameReadyTimeout = 15,          -- Prazo maximo para personagem e mapa aparecerem
     LoadingGuiSoftTimeout = 4,      -- Depois disso, mapa+personagem liberam o scanner
     VisitedServerTTL = 3600,        -- Reutiliza servidores apos uma hora
@@ -137,6 +137,10 @@ local Runtime = {
     FireTouchInterest = runtimeValue("firetouchinterest"),
     FireSignal = runtimeValue("firesignal"),
     LoadString = runtimeValue("loadstring"),
+    Request = runtimeValue("request")
+        or runtimeValue("http_request")
+        or (type(synRuntime) == "table" and synRuntime.request)
+        or (type(fluxusRuntime) == "table" and fluxusRuntime.request),
     QueueOnTeleport = runtimeValue("queue_on_teleport")
         or runtimeValue("queueonteleport")
         or (type(synRuntime) == "table" and synRuntime.queue_on_teleport)
@@ -1936,36 +1940,103 @@ saveVisitedServer = function(jobId)
     end)
 end
 
-local function fetchPublicServerCandidates(placeId, currentJob)
+local function fetchHttpBody(url)
+    local errors = {}
+
+    -- Muitos executores permitem request/http_request mesmo quando game:HttpGet
+    -- recebe bloqueio, rate-limit ou resposta vazia para games.roblox.com.
+    if type(Runtime.Request) == "function" then
+        local ok, response = pcall(Runtime.Request, {
+            Url = url,
+            Method = "GET",
+            Headers = {
+                ["Accept"] = "application/json",
+                ["Cache-Control"] = "no-cache",
+            },
+        })
+        if ok and type(response) == "table" then
+            local status = tonumber(response.StatusCode or response.Status or response.status_code) or 0
+            local body = response.Body or response.body
+            if type(body) == "string" and #body > 0 and (status == 0 or (status >= 200 and status < 300)) then
+                return body, "request"
+            end
+            table.insert(errors, "request HTTP " .. tostring(status))
+        elseif not ok then
+            table.insert(errors, "request: " .. tostring(response))
+        end
+    end
+
+    local ok, body = pcall(function()
+        return game:HttpGet(url, true)
+    end)
+    if ok and type(body) == "string" and #body > 0 then
+        return body, "HttpGet"
+    end
+    table.insert(errors, "HttpGet: " .. tostring(body))
+
+    return nil, table.concat(errors, " | ")
+end
+
+local function fetchPublicServerCandidates(placeId, currentJob, ignoreVisited, sortOrder)
     local candidates = {}
     local cursor = nil
+    local pagesRead = 0
+    local serversSeen = 0
+    local lastError = nil
+    local transportUsed = nil
+    sortOrder = sortOrder == "Desc" and "Desc" or "Asc"
+
     for _ = 1, 5 do
+        -- Não usa excludeFullGames no query: alguns proxies/executores devolvem
+        -- erro/resultado vazio com esse parâmetro. Servidores cheios já são
+        -- filtrados localmente abaixo.
         local url = string.format(
-            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true%s",
+            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=%s&limit=100%s",
             tostring(placeId),
+            sortOrder,
             cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
         )
-        local ok, data = pcall(function()
-            return HttpService:JSONDecode(game:HttpGet(url))
+
+        local body, transportOrError = fetchHttpBody(url)
+        if not body then
+            lastError = transportOrError
+            break
+        end
+        transportUsed = transportOrError
+
+        local decodeOk, data = pcall(function()
+            return HttpService:JSONDecode(body)
         end)
-        if not ok or type(data) ~= "table" then break end
-        for _, srv in ipairs(type(data.data) == "table" and data.data or {}) do
+        if not decodeOk or type(data) ~= "table" then
+            lastError = "JSON invalido via " .. tostring(transportUsed)
+            break
+        end
+
+        pagesRead = pagesRead + 1
+        local list = type(data.data) == "table" and data.data or {}
+        serversSeen = serversSeen + #list
+
+        for _, srv in ipairs(list) do
             local failedUntil = type(srv) == "table" and State.FailedServerUntil[srv.id] or nil
+            local notVisited = ignoreVisited or not visitedServers[srv.id]
             if type(srv) == "table" and type(srv.id) == "string" and srv.id ~= currentJob
                 and type(srv.playing) == "number" and type(srv.maxPlayers) == "number"
                 and srv.playing >= 0 and srv.playing < srv.maxPlayers
-                and not visitedServers[srv.id] and (not failedUntil or failedUntil <= os.clock()) then
+                and notVisited and (not failedUntil or failedUntil <= os.clock()) then
                 table.insert(candidates, {Id = srv.id, Playing = srv.playing})
             end
         end
+
         cursor = data.nextPageCursor
         if type(cursor) ~= "string" or cursor == "" then break end
     end
+
     table.sort(candidates, function(a, b)
         if a.Playing ~= b.Playing then return a.Playing < b.Playing end
         return a.Id < b.Id
     end)
-    return candidates
+
+    return candidates, lastError, pagesRead, serversSeen, transportUsed
 end
 
 doServerHop = function(reason, isRetry)
@@ -1983,7 +2054,7 @@ doServerHop = function(reason, isRetry)
     if isRetry and State.HopAttempts >= Config.MaxHopAttempts then
         State.HopBlocked = true
         State.IsHopping = false
-        State.StatusMessage = "Hop falhou 3 vezes; retry automatico interrompido"
+        State.StatusMessage = string.format("Hop falhou %d vezes; retry automatico interrompido", Config.MaxHopAttempts)
         addLog("ERRO", "Limite de tentativas de hop atingido; loop interrompido")
         return
     end
@@ -2068,46 +2139,47 @@ doServerHop = function(reason, isRetry)
     local placeId = game.PlaceId
     local currentJob = game.JobId
 
-    -- Server hop real desde a primeira tentativa: seleciona explicitamente outro
-    -- JobId do MESMO PlaceId. Isso evita depender do matchmaking generico, que
-    -- pode falhar em sub-places (ex.: Sea 2) e exibir prompt 773/restricted.
-    local candidates = fetchPublicServerCandidates(placeId, currentJob)
+    -- 1) Busca servidores menos cheios; 2) ignora histórico se necessário;
+    -- 3) tenta ordem inversa para contornar respostas/páginas inconsistentes.
+    local candidates, fetchError, pagesRead, serversSeen, transportUsed =
+        fetchPublicServerCandidates(placeId, currentJob, false, "Asc")
+
     if #candidates == 0 then
-        -- Se o TTL esgotou o pool, libera somente os visitados antigos e tenta
-        -- novamente. O servidor atual continua excluido pelo currentJob.
-        local hadVisited = next(visitedServers) ~= nil
-        if hadVisited then
-            for jobId in pairs(visitedServers) do
-                if jobId ~= currentJob then
-                    visitedServers[jobId] = nil
-                end
-            end
-            candidates = fetchPublicServerCandidates(placeId, currentJob)
-        end
+        candidates, fetchError, pagesRead, serversSeen, transportUsed =
+            fetchPublicServerCandidates(placeId, currentJob, true, "Asc")
+    end
+
+    if #candidates == 0 then
+        candidates, fetchError, pagesRead, serversSeen, transportUsed =
+            fetchPublicServerCandidates(placeId, currentJob, true, "Desc")
     end
 
     local chosen = candidates[1] and candidates[1].Id or nil
-    if not chosen then
-        State.IsHopping = false
-        State.StatusMessage = "Nenhum servidor publico elegivel encontrado; tentando novamente..."
-        addLog("WARN", "API de servidores nao retornou JobId elegivel para place " .. tostring(placeId))
-        if Config.AutoReconnect and State.HopAttempts < Config.MaxHopAttempts then
-            task.delay(2, function()
-                if not State.Unloaded and State.HopToken == hopToken and doServerHop then
-                    doServerHop("Nova consulta de servidores publicos", true)
-                end
-            end)
-        else
-            State.HopBlocked = true
-        end
-        return
-    end
+    local teleportOk, teleportError
 
-    State.PendingServerId = chosen
-    local teleportOk, teleportError = pcall(function()
-        addLog("HOP", "Tentando servidor publico " .. tostring(chosen))
-        TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
-    end)
+    if chosen then
+        State.PendingServerId = chosen
+        addLog("HOP", string.format(
+            "Servidor encontrado via %s | paginas=%d vistos=%d | jogadores=%d",
+            tostring(transportUsed or "?"), tonumber(pagesRead) or 0,
+            tonumber(serversSeen) or 0, tonumber(candidates[1].Playing) or -1
+        ))
+        teleportOk, teleportError = pcall(function()
+            TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
+        end)
+    else
+        -- Último recurso: se o executor não consegue acessar a API pública,
+        -- ainda tenta pedir ao matchmaking do Roblox outro servidor em vez de
+        -- ficar parado em 15/15 para sempre.
+        addLog("WARN", string.format(
+            "Sem JobId pela API (paginas=%d vistos=%d erro=%s); usando fallback de matchmaking",
+            tonumber(pagesRead) or 0, tonumber(serversSeen) or 0, tostring(fetchError or "nenhum")
+        ))
+        State.PendingServerId = nil
+        teleportOk, teleportError = pcall(function()
+            TeleportService:Teleport(placeId, LocalPlayer)
+        end)
+    end
 
     if not teleportOk then
         markPendingServerFailed()
