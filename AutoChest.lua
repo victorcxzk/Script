@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.2)
+    AUTO CHEST & SERVER HOP (v2.7.3)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,8 +27,8 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.2"
-local SCRIPT_BUILD = "2026-10-06 / hop-http-fallback-and-fast-approach"
+local SCRIPT_VERSION = "2.7.3"
+local SCRIPT_BUILD = "2026-10-06 / direct-flight-zero-chest-delay"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
@@ -70,17 +70,17 @@ local Config = {
     TweenSpeed = IS_SEA_2 and 215 or 180, -- Sea 2 recebe cruzeiro maior; Sea 1/3 ficam conservadoras
     VerticalSpeed = IS_SEA_2 and 95 or 80,   -- Subida/descida de viagem
     MovementTimeout = 90,           -- Prazo por trecho; viagens longas sao divididas em trechos
-    FinalApproachDistance = 25,     -- Só abandona a rota alta quando o bau ja esta realmente perto
-    FinalApproachSpeed = IS_SEA_2 and 150 or 125, -- Mantem velocidade alta ate quase encostar no bau
-    ContactSpeed = IS_SEA_2 and 48 or 42, -- Apenas o ultimo contato fica controlado, sem a antiga "freada"
+    FinalApproachDistance = 25,     -- Mantido por compatibilidade; voo normal agora e direto
+    FinalApproachSpeed = IS_SEA_2 and 150 or 125, -- Mantido para rotinas auxiliares
+    ContactSpeed = IS_SEA_2 and 48 or 42, -- Ultimo metro do contato; voo ate o bau continua rapido
     ArrivalTolerance = 5,           -- Distancia maxima para considerar que chegou ao bau
 
     Noclip = true,                  -- Atravessa paredes durante o deslocamento
     AntiSit = true,                 -- Impede cadeiras/bancos de prenderem o personagem
     BypassWater = true,             -- Mantem o personagem suspenso para nao tomar dano de agua do mar
     SafeTravelHeight = 45,          -- Altura minima usada durante a travessia rapida
-    CollectDelay = 0.35,            -- Intervalo (segundos) entre cada coleta
-    TouchHold = 0.40,               -- Tempo mantendo contato com o gatilho do bau
+    CollectDelay = 0,               -- Sem espera artificial: confirmou -> procura o proximo imediatamente
+    TouchHold = 0.20,               -- Contato curto; suficiente para gerar Touched sem segurar o ciclo
     CollectionTimeout = 3.0,        -- Prazo para o servidor confirmar a coleta
     RewardReplicationGrace = 1.5,   -- Tolera atraso da replicacao de Beli/Fragments
     CollectionRetries = 3,          -- Novas tentativas antes de desistir do bau
@@ -251,8 +251,8 @@ local function normalizeSettings()
     Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 100)
     Config.MovementTimeout = math.clamp(Config.MovementTimeout, 10, 180)
     Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 80)
-    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 80)
-    Config.ContactSpeed = math.clamp(Config.ContactSpeed, 2, 20)
+    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 180)
+    Config.ContactSpeed = math.clamp(Config.ContactSpeed, 2, 60)
     Config.ArrivalTolerance = math.clamp(Config.ArrivalTolerance, 0.5, 8)
     Config.TouchHold = math.clamp(Config.TouchHold, 0.2, 2)
     Config.CollectionTimeout = math.clamp(Config.CollectionTimeout, 1, 10)
@@ -1235,18 +1235,9 @@ local function getAdaptiveTravelSpeed(distance)
 end
 
 local function estimateChestTravelTime(origin, target)
+    -- O movimento real agora e uma linha reta do personagem ate o bau.
     local directDistance = (target - origin).Magnitude
-    if not Config.BypassWater or directDistance <= Config.FinalApproachDistance then
-        return directDistance / math.max(Config.FinalApproachSpeed, 1)
-    end
-
-    local clearance = math.max(origin.Y, target.Y + 35, Config.SafeTravelHeight)
-    local climb = math.max(0, clearance - origin.Y)
-    local descent = math.max(0, clearance - target.Y)
-    local horizontal = Vector3.new(target.X - origin.X, 0, target.Z - origin.Z).Magnitude
-    return climb / math.max(Config.VerticalSpeed, 1)
-        + horizontal / math.max(getAdaptiveTravelSpeed(horizontal), 1)
-        + descent / math.max(Config.FinalApproachSpeed, 1)
+    return directDistance / math.max(getAdaptiveTravelSpeed(directDistance), 1)
 end
 
 local function ensureChestESPContainer()
@@ -1680,42 +1671,26 @@ local function moveToPosition(targetCFrame, speed, context)
     return arrived
 end
 
--- Planeja tres trechos: subir, cruzar na altura segura, descer sobre o bau.
+-- Voo direto: nao cria subida, altura de cruzeiro nem descida artificial.
+-- O VectorForce continua compensando a gravidade e o noclip permanece ativo.
 local function buildChestRoute(origin, finalPosition)
-    local route
-    if not Config.BypassWater or (finalPosition - origin).Magnitude <= Config.FinalApproachDistance then
-        route = {{Position = finalPosition, Speed = Config.FinalApproachSpeed, Phase = "aproximacao"}}
-    else
-        -- A distancia que decide a rota direta nao deve virar altura extra. Uma
-        -- folga fixa evita subir exageradamente antes de cada bau elevado.
-        local clearance = math.max(origin.Y, finalPosition.Y + 35, Config.SafeTravelHeight)
-        local horizontalDistance = Vector3.new(finalPosition.X - origin.X, 0, finalPosition.Z - origin.Z).Magnitude
-        local cruiseSpeed = getAdaptiveTravelSpeed(horizontalDistance)
-        route = {
-            {Position = Vector3.new(origin.X, clearance, origin.Z), Speed = Config.VerticalSpeed, Phase = "subida"},
-            {Position = Vector3.new(finalPosition.X, clearance, finalPosition.Z), Speed = cruiseSpeed, Phase = "travessia estavel"},
-            {Position = finalPosition, Speed = Config.FinalApproachSpeed, Phase = "descida"},
-        }
+    local distance = (finalPosition - origin).Magnitude
+    local speed = getAdaptiveTravelSpeed(distance)
+
+    -- Normalmente e um unico Tween reto. Apenas distancias extremas sao
+    -- divididas para manter cada Tween abaixo do MovementTimeout.
+    local safeDistancePerTween = math.max(1000, speed * Config.MovementTimeout * 0.80)
+    local count = math.max(1, math.ceil(distance / safeDistancePerTween))
+    local segments = {}
+
+    for segmentIndex = 1, count do
+        table.insert(segments, {
+            Position = origin:Lerp(finalPosition, segmentIndex / count),
+            Speed = speed,
+            Phase = "voo direto",
+        })
     end
 
-    -- Fishmen no dump fica a mais de 60 mil studs: mantem acesso sem TP,
-    -- dividindo viagens extensas em tweens com prazo individual.
-    local segments = {}
-    local previous = origin
-    for _, waypoint in ipairs(route) do
-        local distance = (waypoint.Position - previous).Magnitude
-        local timeoutSegments = math.ceil(distance / (waypoint.Speed * Config.MovementTimeout * 0.8))
-        local distanceSegments = math.ceil(distance / MAX_MOVEMENT_SEGMENT_DISTANCE)
-        local count = math.max(1, timeoutSegments, distanceSegments)
-        for segmentIndex = 1, count do
-            table.insert(segments, {
-                Position = previous:Lerp(waypoint.Position, segmentIndex / count),
-                Speed = waypoint.Speed,
-                Phase = waypoint.Phase,
-            })
-        end
-        previous = waypoint.Position
-    end
     return segments
 end
 
@@ -1726,7 +1701,7 @@ local function moveToChest(part, context)
     local route = buildChestRoute(root.Position, finalPosition)
     for index, waypoint in ipairs(route) do
         if not part:IsDescendantOf(Workspace) then return false end
-        if waypoint.Phase == "descida" or waypoint.Phase == "aproximacao" then
+        if index == #route then
             context.PrepareContact()
         end
         local displayedSpeed = State.SafeSpeedMode
@@ -2691,9 +2666,8 @@ addLog("BOOT", string.format("%s v%s | build %s | place=%s | job=%s",
     SCRIPT_NAME, SCRIPT_VERSION, SCRIPT_BUILD, tostring(game.PlaceId), tostring(game.JobId)))
 addLog("SOURCE", RAW_SCRIPT_URL)
 addLog("BOOT", "Scanner baseado no dump: Workspace.Map + Chest1/2/3 + TouchTransmitter")
-addLog("MOVE", string.format("Perfil estavel | viagem=%.0f-%.0f/s vertical=%.0f/s contato=%.0f/s trecho<=%d",
-    Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.VerticalSpeed, Config.ContactSpeed,
-    MAX_MOVEMENT_SEGMENT_DISTANCE))
+addLog("MOVE", string.format("Perfil direto | voo=%.0f-%.0f/s contato=%.0f/s | sem subida/descida | delay=%.2fs",
+    Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.ContactSpeed, Config.CollectDelay))
 addLog("ESP", "Sempre ativo | bronze=laranja prata=claro ouro=amarelo")
 addLog("TEAM", "Selecao automatica de Piratas ativa apos execute e server hop")
 addLog("UPDATE", string.format("Verificacao automatica a cada %ds", UPDATE_CHECK_INTERVAL))
@@ -2871,7 +2845,9 @@ local function runCollectionCycle()
     if not collected and not State.IsHopping and not State.IsRespawning then
         State.StatusMessage = "Coleta nao confirmada; selecionando outro bau"
     end
-    task.wait(Config.CollectDelay)
+    if Config.CollectDelay > 0 then
+        task.wait(Config.CollectDelay)
+    end
 end
 
 -- Atualiza o HUD durante viagens longas; a coleta continua serial no outro loop.
@@ -2905,7 +2881,7 @@ task.spawn(function()
     addLog("INFO", Config.Enabled and "Mapa pronto; iniciando ciclo de coleta" or "Mapa pronto; configuracao salva esta pausada")
     if not Config.Enabled then State.StatusMessage = "Pausado conforme configuracao salva" end
     while not State.Unloaded do
-        task.wait(0.1)
+        task.wait()
         if Config.Enabled and not State.IsHopping then
             local cycleOk, cycleError = pcall(runCollectionCycle)
             if not cycleOk then
