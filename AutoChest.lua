@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.4.0)
+    AUTO CHEST & SERVER HOP (v2.5.0)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,10 +27,11 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.4.0"
-local SCRIPT_BUILD = "2026-10-06 / factory-esp-stable-motion"
+local SCRIPT_VERSION = "2.5.0"
+local SCRIPT_BUILD = "2026-10-06 / adaptive-express-routing"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
-local SETTINGS_SCHEMA = 2
+local SETTINGS_SCHEMA = 3
+local MAX_ADAPTIVE_TRAVEL_SPEED = 320
 
 -- ============================================================================
 -- 1. CONFIGURACOES DO USUARIO
@@ -45,11 +46,11 @@ local Config = {
     ScannerWarmup = 8,              -- Impede hop antes do scanner estabilizar
     MinimumChestAnchors = 3,        -- Evita Hop enquanto o mapa ainda esta incompleto
 
-    TweenSpeed = 190,               -- Viagem mais rapida; contato continua lento e confiavel
-    VerticalSpeed = 75,             -- Subida e descida controladas
+    TweenSpeed = 240,               -- Velocidade base; viagens longas aceleram progressivamente
+    VerticalSpeed = 105,            -- Subida e descida rapidas, ainda continuas
     MovementTimeout = 90,           -- Prazo por trecho; viagens longas sao divididas em trechos
-    FinalApproachDistance = 55,     -- Alvos proximos nao fazem a rota alta completa
-    FinalApproachSpeed = 55,        -- Velocidade da aproximacao final
+    FinalApproachDistance = 70,     -- Alvos proximos nao fazem a rota alta completa
+    FinalApproachSpeed = 65,        -- Aproximacao rapida antes do contato controlado
     ContactSpeed = 14,              -- Velocidade ao entrar no hitbox do bau
     ArrivalTolerance = 5,           -- Distancia maxima para considerar que chegou ao bau
 
@@ -178,6 +179,12 @@ local function loadSettings()
         if Config.FinalApproachDistance == 35 then Config.FinalApproachDistance = 55 end
         if Config.FinalApproachSpeed == 45 then Config.FinalApproachSpeed = 55 end
     end
+    if savedSchema < 3 then
+        if Config.TweenSpeed == 190 then Config.TweenSpeed = 240 end
+        if Config.VerticalSpeed == 75 then Config.VerticalSpeed = 105 end
+        if Config.FinalApproachDistance == 55 then Config.FinalApproachDistance = 70 end
+        if Config.FinalApproachSpeed == 55 then Config.FinalApproachSpeed = 65 end
+    end
     settingsLoadMessage = string.format("%d configuracoes restauradas%s", applied,
         loadedFile == legacySettingsFile and " (configuracoes antigas migradas)" or "")
 end
@@ -205,11 +212,11 @@ local function normalizeSettings()
     Config.LoadingGuiSoftTimeout = math.clamp(tonumber(Config.LoadingGuiSoftTimeout) or 4, 1, 8)
     Config.ScannerWarmup = math.clamp(tonumber(Config.ScannerWarmup) or 8, 3, 30)
     Config.SafeTravelHeight = math.clamp(tonumber(Config.SafeTravelHeight) or 45, 20, 150)
-    Config.TweenSpeed = math.clamp(Config.TweenSpeed, 20, 240)
-    Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 110)
+    Config.TweenSpeed = math.clamp(Config.TweenSpeed, 20, 280)
+    Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 140)
     Config.MovementTimeout = math.clamp(Config.MovementTimeout, 10, 180)
-    Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 90)
-    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 70)
+    Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 110)
+    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 90)
     Config.ContactSpeed = math.clamp(Config.ContactSpeed, 2, 20)
     Config.ArrivalTolerance = math.clamp(Config.ArrivalTolerance, 0.5, 3)
     Config.TouchHold = math.clamp(Config.TouchHold, 0.2, 2)
@@ -831,6 +838,28 @@ local function isValidChest(inst)
     return true, part
 end
 
+local function getAdaptiveTravelSpeed(distance)
+    -- Mantem a velocidade base em percursos comuns e adiciona ate 80 studs/s
+    -- em viagens longas. O contato com o bau nao usa este boost.
+    local boostRatio = math.clamp((distance - 250) / 1750, 0, 1)
+    return math.min(Config.TweenSpeed + boostRatio * 80, MAX_ADAPTIVE_TRAVEL_SPEED)
+end
+
+local function estimateChestTravelTime(origin, target)
+    local directDistance = (target - origin).Magnitude
+    if not Config.BypassWater or directDistance <= Config.FinalApproachDistance then
+        return directDistance / math.max(Config.FinalApproachSpeed, 1)
+    end
+
+    local clearance = math.max(origin.Y, target.Y + 35, Config.SafeTravelHeight)
+    local climb = math.max(0, clearance - origin.Y)
+    local descent = math.max(0, clearance - target.Y)
+    local horizontal = Vector3.new(target.X - origin.X, 0, target.Z - origin.Z).Magnitude
+    return climb / math.max(Config.VerticalSpeed, 1)
+        + horizontal / math.max(getAdaptiveTravelSpeed(horizontal), 1)
+        + descent / math.max(Config.FinalApproachSpeed, 1)
+end
+
 local function ensureChestESPContainer()
     if State.ESPContainer and State.ESPContainer.Parent then return State.ESPContainer end
 
@@ -1001,6 +1030,7 @@ local function scanAllChests()
                 Part = part,
                 Position = part.Position,
                 Distance = dist,
+                TravelTime = estimateChestTravelTime(myPos, part.Position + Vector3.new(0, 1.5, 0)),
                 Priority = priority,
                 Name = desc.Name,
             }
@@ -1017,9 +1047,10 @@ local function scanAllChests()
         end
     end
 
-    -- Confiabilidade primeiro: coleta o bau mais proximo. Priorizar ouro antes
-    -- da distancia fazia o personagem cruzar o mapa em tweens muito longos.
+    -- Coleta o bau que exige menos tempo estimado de rota, considerando subida,
+    -- travessia e descida. Distancia reta so desempata rotas equivalentes.
     table.sort(chests, function(a, b)
+        if a.TravelTime ~= b.TravelTime then return a.TravelTime < b.TravelTime end
         if a.Distance ~= b.Distance then return a.Distance < b.Distance end
         return a.Priority > b.Priority
     end)
@@ -1129,9 +1160,11 @@ local function buildChestRoute(origin, finalPosition)
         -- A distancia que decide a rota direta nao deve virar altura extra. Uma
         -- folga fixa evita subir exageradamente antes de cada bau elevado.
         local clearance = math.max(origin.Y, finalPosition.Y + 35, Config.SafeTravelHeight)
+        local horizontalDistance = Vector3.new(finalPosition.X - origin.X, 0, finalPosition.Z - origin.Z).Magnitude
+        local cruiseSpeed = getAdaptiveTravelSpeed(horizontalDistance)
         route = {
             {Position = Vector3.new(origin.X, clearance, origin.Z), Speed = Config.VerticalSpeed, Phase = "subida"},
-            {Position = Vector3.new(finalPosition.X, clearance, finalPosition.Z), Speed = Config.TweenSpeed, Phase = "travessia"},
+            {Position = Vector3.new(finalPosition.X, clearance, finalPosition.Z), Speed = cruiseSpeed, Phase = "travessia expressa"},
             {Position = finalPosition, Speed = Config.FinalApproachSpeed, Phase = "descida"},
         }
     end
@@ -1871,8 +1904,8 @@ addLog("BOOT", string.format("%s v%s | build %s | place=%s | job=%s",
     SCRIPT_NAME, SCRIPT_VERSION, SCRIPT_BUILD, tostring(game.PlaceId), tostring(game.JobId)))
 addLog("SOURCE", RAW_SCRIPT_URL)
 addLog("BOOT", "Scanner baseado no dump: Workspace.Map + Chest1/2/3 + TouchTransmitter")
-addLog("MOVE", string.format("Movimento continuo | viagem=%.0f/s vertical=%.0f/s contato=%.0f/s",
-    Config.TweenSpeed, Config.VerticalSpeed, Config.ContactSpeed))
+addLog("MOVE", string.format("Modo expresso | viagem=%.0f-%.0f/s vertical=%.0f/s contato=%.0f/s",
+    Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.VerticalSpeed, Config.ContactSpeed))
 addLog("ESP", "Sempre ativo | bronze=laranja prata=claro ouro=amarelo")
 State.SettingsPersisted = saveSettings()
 addLog("SETTINGS", settingsLoadMessage .. (State.SettingsPersisted and " | persistencia OK" or " | falha ao salvar"))
@@ -2016,7 +2049,8 @@ local function runCollectionCycle()
     State.LastGuardReason = nil
     local target = availableChests[1]
     State.CurrentTarget = target
-    State.StatusMessage = string.format("Coletando %s (%.0fm)", target.Name, target.Distance)
+    State.StatusMessage = string.format("Coletando %s (%.1fs / %.0fm)",
+        target.Name, target.TravelTime, target.Distance)
 
     local collectOk, collected = pcall(collectChest, target)
     -- O gatilho confirmado ja desapareceu; nao levanta o personagem novamente.
