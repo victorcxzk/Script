@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.6.1)
+    AUTO CHEST & SERVER HOP (v2.7.0)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,15 +27,22 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.6.1"
-local SCRIPT_BUILD = "2026-10-06 / stable-segmented-motion"
+local SCRIPT_VERSION = "2.7.0"
+local SCRIPT_BUILD = "2026-10-06 / reliability-and-performance"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
-local SETTINGS_SCHEMA = 4
+local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
+local SETTINGS_SCHEMA = 5
 local MAX_ADAPTIVE_TRAVEL_SPEED = 190
 local MAX_MOVEMENT_SEGMENT_DISTANCE = 120
 local RUBBERBAND_FALLBACK_SPEED = 125
 local UPDATE_CHECK_INTERVAL = 60
 local AUTO_TEAM_NAME = "Pirates"
+local TEAM_SELECTION_TIMEOUT = 25
+local SCANNER_FULL_RESCAN_INTERVAL = 30
+local DEBUG_LOG_MAX_BYTES = 1024 * 1024
+local DEBUG_LOG_RETAIN_BYTES = 256 * 1024
+local UPDATE_CACHE_FILE = "AutoChest_LastKnownGood.lua"
+local MAX_UPDATE_SOURCE_BYTES = 500 * 1024
 
 -- ============================================================================
 -- 1. CONFIGURACOES DO USUARIO
@@ -65,6 +72,7 @@ local Config = {
     CollectDelay = 0.35,            -- Intervalo (segundos) entre cada coleta
     TouchHold = 0.40,               -- Tempo mantendo contato com o gatilho do bau
     CollectionTimeout = 3.0,        -- Prazo para o servidor confirmar a coleta
+    RewardReplicationGrace = 1.5,   -- Tolera atraso da replicacao de Beli/Fragments
     CollectionRetries = 3,          -- Novas tentativas antes de desistir do bau
     FailedChestCooldown = 8,        -- Evita insistir imediatamente no mesmo bau
 
@@ -150,10 +158,24 @@ local CoreGui = safeService("CoreGui")
 local VirtualUser = safeService("VirtualUser")
 local UserInputService = safeService("UserInputService")
 local VirtualInputManager = safeService("VirtualInputManager")
+local CollectionService = safeService("CollectionService")
 
 local settingsFile = "AutoChest_Settings.json"
 local legacySettingsFile = "BF_AutoChest_Settings.json"
 local settingsLoadMessage = "Configuracoes padrao em uso"
+-- Somente escolhas reais do usuario sao persistidas. Parametros internos de
+-- movimento permanecem controlados pela versao para uma configuracao antiga
+-- nunca reativar velocidades que causam rubberband.
+local PERSISTED_SETTING_KEYS = {
+    Enabled = true,
+    Minimized = true,
+    TargetChests = true,
+    HopWhenEmpty = true,
+    HopAfterTarget = true,
+    AntiAFK = true,
+    AutoReconnect = true,
+    PersistOnTeleport = true,
+}
 
 local function loadSettings()
     if not (Runtime.IsFile and Runtime.ReadFile) then return end
@@ -173,33 +195,15 @@ local function loadSettings()
     local savedSchema = tonumber(saved.__SchemaVersion) or 1
     local applied = 0
     for key, value in pairs(saved) do
-        if Config[key] ~= nil and type(value) == type(Config[key])
+        if PERSISTED_SETTING_KEYS[key] and Config[key] ~= nil and type(value) == type(Config[key])
             and (type(value) ~= "number" or (value == value and math.abs(value) < math.huge)) then
             Config[key] = value
             applied = applied + 1
         end
     end
-    -- Migra apenas os antigos valores de fabrica. Valores personalizados mais
-    -- altos continuam intactos, e a entrada no hitbox permanece deliberadamente lenta.
-    if savedSchema < 2 then
-        if Config.TweenSpeed == 150 then Config.TweenSpeed = 190 end
-        if Config.VerticalSpeed == 60 then Config.VerticalSpeed = 75 end
-        if Config.FinalApproachDistance == 35 then Config.FinalApproachDistance = 55 end
-        if Config.FinalApproachSpeed == 45 then Config.FinalApproachSpeed = 55 end
-    end
-    if savedSchema < 3 then
-        if Config.TweenSpeed == 190 then Config.TweenSpeed = 240 end
-        if Config.VerticalSpeed == 75 then Config.VerticalSpeed = 105 end
-        if Config.FinalApproachDistance == 55 then Config.FinalApproachDistance = 70 end
-        if Config.FinalApproachSpeed == 55 then Config.FinalApproachSpeed = 65 end
-    end
-    -- A v2.5/v2.6 excedia o limite pratico de alguns servidores e causava
-    -- rubberband (correcoes que pareciam TP). Migra esses valores para o perfil estavel.
-    if savedSchema < 4 then
-        if Config.TweenSpeed == 240 then Config.TweenSpeed = 170 end
-        if Config.VerticalSpeed == 105 then Config.VerticalSpeed = 75 end
-        if Config.FinalApproachDistance == 70 then Config.FinalApproachDistance = 55 end
-        if Config.FinalApproachSpeed == 65 then Config.FinalApproachSpeed = 48 end
+    if savedSchema < SETTINGS_SCHEMA then
+        settingsLoadMessage = string.format("%d configuracoes restauradas; perfil interno atualizado", applied)
+        return
     end
     settingsLoadMessage = string.format("%d configuracoes restauradas%s", applied,
         loadedFile == legacySettingsFile and " (configuracoes antigas migradas)" or "")
@@ -212,7 +216,8 @@ local function saveSettings()
     serializable.__SchemaVersion = SETTINGS_SCHEMA
     for key, value in pairs(Config) do
         local valueType = type(value)
-        if valueType == "boolean" or valueType == "number" or valueType == "string" then
+        if PERSISTED_SETTING_KEYS[key]
+            and (valueType == "boolean" or valueType == "number" or valueType == "string") then
             serializable[key] = value
         end
     end
@@ -228,15 +233,16 @@ local function normalizeSettings()
     Config.LoadingGuiSoftTimeout = math.clamp(tonumber(Config.LoadingGuiSoftTimeout) or 4, 1, 8)
     Config.ScannerWarmup = math.clamp(tonumber(Config.ScannerWarmup) or 8, 3, 30)
     Config.SafeTravelHeight = math.clamp(tonumber(Config.SafeTravelHeight) or 45, 20, 150)
-    Config.TweenSpeed = math.clamp(Config.TweenSpeed, 20, 210)
+    Config.TweenSpeed = math.clamp(Config.TweenSpeed, 20, MAX_ADAPTIVE_TRAVEL_SPEED)
     Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 100)
     Config.MovementTimeout = math.clamp(Config.MovementTimeout, 10, 180)
     Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 80)
     Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 60)
     Config.ContactSpeed = math.clamp(Config.ContactSpeed, 2, 20)
-    Config.ArrivalTolerance = math.clamp(Config.ArrivalTolerance, 0.5, 3)
+    Config.ArrivalTolerance = math.clamp(Config.ArrivalTolerance, 0.5, 8)
     Config.TouchHold = math.clamp(Config.TouchHold, 0.2, 2)
     Config.CollectionTimeout = math.clamp(Config.CollectionTimeout, 1, 10)
+    Config.RewardReplicationGrace = math.clamp(Config.RewardReplicationGrace, 0.5, 4)
     Config.CollectionRetries = math.clamp(math.floor(Config.CollectionRetries), 1, 5)
     Config.FailedChestCooldown = math.clamp(Config.FailedChestCooldown, 2, 60)
     Config.EmptyScanGrace = math.clamp(Config.EmptyScanGrace, 10, 60)
@@ -252,7 +258,8 @@ while not LocalPlayer do
     LocalPlayer = Players.LocalPlayer
 end
 
--- Reexecutar o arquivo descarrega a instancia anterior em vez de criar loops duplicados.
+-- A instancia anterior permanece viva durante a inicializacao. Ela so e
+-- descarregada depois que esta versao sinalizar Ready, permitindo rollback real.
 local globalEnv = _G
 if type(Runtime.GetGlobalEnvironment) == "function" then
     pcall(function()
@@ -261,17 +268,17 @@ if type(Runtime.GetGlobalEnvironment) == "function" then
 end
 local previousController = rawget(globalEnv, "AutoChestController")
     or rawget(globalEnv, "BFAutoChestController")
-if type(previousController) == "table" and type(previousController.Unload) == "function" then
-    pcall(previousController.Unload)
+if type(previousController) == "table" and type(previousController.SaveSettings) == "function" then
+    pcall(previousController.SaveSettings)
 end
--- O unload anterior pode salvar escolhas pendentes; so depois le o JSON.
 loadSettings()
 normalizeSettings()
 local Controller = {}
-globalEnv.AutoChestController = Controller
 Controller.SaveSettings = saveSettings
 Controller.Config = Config
 Controller.Version = SCRIPT_VERSION
+Controller.Build = SCRIPT_BUILD
+Controller.Ready = false
 
 -- ============================================================================
 -- 3. ESTADO GLOBAL DA SESSAO
@@ -290,10 +297,14 @@ local State = {
     Connections = {},
     EmptySince = nil,
     Unloaded = false,
+    Activated = false,
     HasValidScan = false,
     LogEntries = {},
     LastScanSignature = nil,
     LastScanLogAt = 0,
+    LastMovementLogAt = 0,
+    LastMovementLogPhase = nil,
+    DebugLogBytes = nil,
     LastGuardReason = nil,
     LastScanDiagnostics = nil,
     HopAttempts = 0,
@@ -319,6 +330,10 @@ local State = {
     EmptyScanMap = nil,
     EmptyScanAnchors = nil,
     LastScannerMap = nil,
+    ChestRegistry = setmetatable({}, {__mode = "k"}),
+    ScannerConnections = {},
+    ScannerDescendantCount = 0,
+    LastFullScannerRescan = 0,
     SeatHumanoid = nil,
     OriginalSeatedEnabled = nil,
     OriginalSeatTouch = setmetatable({}, {__mode = "k"}),
@@ -331,14 +346,26 @@ local State = {
     RemoteVersion = nil,
     RemoteSource = nil,
     LastUpdateError = nil,
+    LastAnnouncedUpdate = nil,
     TeamSelectionAttempts = 0,
     PirateTeamReady = false,
+    TeamSelectionBlocked = false,
+    TeamSelectionInFlight = false,
+    LastReadinessReason = nil,
     SafeSpeedMode = false,
     RubberbandCorrections = 0,
     StableMovementSegments = 0,
+    PendingServerId = nil,
+    FailedServerUntil = {},
+    TeleportStarted = false,
 }
 
 local hud = {}
+
+local function waitForControllerActivation()
+    while not State.Unloaded and not State.Activated do task.wait() end
+    return State.Activated and not State.Unloaded
+end
 
 local function destroyChestESPMarker(part)
     local marker = State.ChestESP[part]
@@ -365,6 +392,42 @@ local function trackConnection(connection)
     return connection
 end
 
+local function appendDebugLog(line)
+    if not (Config.DebugLog and Runtime.AppendFile) then return end
+    local payload = line .. "\n"
+    pcall(function()
+        if State.DebugLogBytes == nil then
+            State.DebugLogBytes = 0
+            if Runtime.IsFile and Runtime.ReadFile and Runtime.IsFile(Config.DebugLogFile) then
+                local existing = Runtime.ReadFile(Config.DebugLogFile)
+                if type(existing) == "string" then
+                    State.DebugLogBytes = #existing
+                    if #existing > DEBUG_LOG_MAX_BYTES and Runtime.WriteFile then
+                        local retained = existing:sub(-DEBUG_LOG_RETAIN_BYTES)
+                        local firstNewline = retained:find("\n", 1, true)
+                        if firstNewline then retained = retained:sub(firstNewline + 1) end
+                        retained = "[LOG ROTACIONADO]\n" .. retained
+                        Runtime.WriteFile(Config.DebugLogFile, retained)
+                        State.DebugLogBytes = #retained
+                    end
+                end
+            end
+        end
+        if State.DebugLogBytes + #payload > DEBUG_LOG_MAX_BYTES and Runtime.WriteFile and Runtime.ReadFile then
+            local existing = Runtime.IsFile and Runtime.IsFile(Config.DebugLogFile)
+                and Runtime.ReadFile(Config.DebugLogFile) or ""
+            local retained = type(existing) == "string" and existing:sub(-DEBUG_LOG_RETAIN_BYTES) or ""
+            local firstNewline = retained:find("\n", 1, true)
+            if firstNewline then retained = retained:sub(firstNewline + 1) end
+            retained = "[LOG ROTACIONADO]\n" .. retained
+            Runtime.WriteFile(Config.DebugLogFile, retained)
+            State.DebugLogBytes = #retained
+        end
+        Runtime.AppendFile(Config.DebugLogFile, payload)
+        State.DebugLogBytes = State.DebugLogBytes + #payload
+    end)
+end
+
 local function addLog(level, message)
     local stamp = os.date("%H:%M:%S")
     local line = string.format("[%s] [%s] %s", stamp, tostring(level), tostring(message))
@@ -379,9 +442,7 @@ local function addLog(level, message)
         print("[AUTO-CHEST] " .. line)
     end
 
-    if Config.DebugLog and Runtime.AppendFile then
-        pcall(Runtime.AppendFile, Config.DebugLogFile, line .. "\n")
-    end
+    appendDebugLog(line)
 end
 
 local function isVersionNewer(candidate, current)
@@ -399,7 +460,7 @@ local function isVersionNewer(candidate, current)
 end
 
 local function extractRemoteVersion(source)
-    if type(source) ~= "string" or #source < 1000 then return nil end
+    if type(source) ~= "string" or #source < 1000 or #source > MAX_UPDATE_SOURCE_BYTES then return nil end
     if not source:find('local SCRIPT_NAME = "Auto Chest"', 1, true) then return nil end
     return source:match('local%s+SCRIPT_VERSION%s*=%s*"([%d%.]+)"')
 end
@@ -409,16 +470,36 @@ local function updateURL(reason)
         tostring(reason or "runtime"), os.time(), math.random(100000, 999999))
 end
 
+local function cacheValidatedSource(source)
+    if not (Runtime.WriteFile and type(source) == "string") then return false end
+    return pcall(Runtime.WriteFile, UPDATE_CACHE_FILE, source)
+end
+
+local function fetchUpdateSource(reason)
+    local urls = {
+        updateURL(reason),
+        string.format("%s?source=%s&time=%d", RAW_SCRIPT_FALLBACK_URL,
+            tostring(reason or "runtime"), os.time()),
+    }
+    local lastError = "nenhuma origem respondeu"
+    for _, url in ipairs(urls) do
+        local fetched, source = pcall(function()
+            return game:HttpGet(url, true)
+        end)
+        if fetched and extractRemoteVersion(source) then return source end
+        lastError = fetched and "resposta invalida" or tostring(source)
+    end
+    return nil, lastError
+end
+
 local function checkForUpdates(reason)
     if State.Unloaded or State.UpdateCheckInFlight or State.UpdateApplying then return false end
     State.UpdateCheckInFlight = true
-    local fetched, source = pcall(function()
-        return game:HttpGet(updateURL(reason), true)
-    end)
+    local source, fetchError = fetchUpdateSource(reason)
     State.UpdateCheckInFlight = false
 
-    if not fetched then
-        local message = "Falha ao consultar atualizacao: " .. tostring(source)
+    if not source then
+        local message = "Falha ao consultar atualizacao: " .. tostring(fetchError)
         if State.LastUpdateError ~= message then
             State.LastUpdateError = message
             addLog("WARN", message)
@@ -436,17 +517,33 @@ local function checkForUpdates(reason)
         return false
     end
 
+    if type(Runtime.LoadString) == "function" then
+        local compileOk, compiled = pcall(Runtime.LoadString, source)
+        if not compileOk or type(compiled) ~= "function" then
+            local message = "Atualizacao remota nao compilou; cache e versao atual preservados"
+            if State.LastUpdateError ~= message then
+                State.LastUpdateError = message
+                addLog("WARN", message)
+            end
+            return false
+        end
+    end
     State.LastUpdateError = nil
     if isVersionNewer(remoteVersion, SCRIPT_VERSION) then
+        local shouldAnnounce = State.LastAnnouncedUpdate ~= remoteVersion
         State.UpdateAvailable = true
         State.RemoteVersion = remoteVersion
         State.RemoteSource = source
         State.StatusMessage = string.format("ATUALIZACAO v%s DISPONIVEL", remoteVersion)
-        addLog("UPDATE", string.format("Nova versao v%s detectada; aguardando confirmacao", remoteVersion))
-        if hud.ShowUpdate then hud.ShowUpdate(remoteVersion) end
+        if shouldAnnounce then
+            State.LastAnnouncedUpdate = remoteVersion
+            addLog("UPDATE", string.format("Nova versao v%s detectada; aguardando confirmacao", remoteVersion))
+            if hud.ShowUpdate then hud.ShowUpdate(remoteVersion) end
+        end
         return true
     end
 
+    if remoteVersion == SCRIPT_VERSION then cacheValidatedSource(source) end
     if reason == "startup" then
         addLog("UPDATE", string.format("v%s e a versao mais recente", SCRIPT_VERSION))
     end
@@ -478,10 +575,17 @@ local function applyAvailableUpdate()
     addLog("UPDATE", State.StatusMessage)
     task.defer(function()
         local ok, runtimeError = pcall(chunk)
-        if not ok and not State.Unloaded then
+        local activeController = rawget(globalEnv, "AutoChestController")
+        local activated = ok and type(activeController) == "table"
+            and activeController ~= Controller and activeController.Ready == true
+            and activeController.Version == State.RemoteVersion
+        if not activated and not State.Unloaded then
             State.UpdateApplying = false
             State.StatusMessage = "Falha ao aplicar atualizacao; versao atual preservada"
-            addLog("ERRO", "Atualizacao falhou: " .. tostring(runtimeError))
+            addLog("ERRO", "Atualizacao falhou sem substituir a versao ativa: " .. tostring(runtimeError))
+            if hud.ShowUpdate then hud.ShowUpdate(State.RemoteVersion) end
+        elseif activated then
+            cacheValidatedSource(State.RemoteSource)
         end
     end)
 end
@@ -567,18 +671,25 @@ local function requestPirateTeam()
 end
 
 local function ensurePirateTeam()
+    if State.TeamSelectionInFlight then return false end
     if isPirateTeam() then
         State.PirateTeamReady = true
+        State.TeamSelectionBlocked = false
         addLog("TEAM", "Piratas ja estava selecionado")
         return true
     end
 
-    while not State.Unloaded and not isPirateTeam() do
+    State.TeamSelectionInFlight = true
+    State.TeamSelectionBlocked = false
+    local deadline = os.clock() + TEAM_SELECTION_TIMEOUT
+    while not State.Unloaded and not isPirateTeam() and os.clock() < deadline do
         State.TeamSelectionAttempts = State.TeamSelectionAttempts + 1
         State.StatusMessage = string.format("Selecionando Piratas... tentativa %d", State.TeamSelectionAttempts)
         local selected, method = requestPirateTeam()
         if selected then
             State.PirateTeamReady = true
+            State.TeamSelectionBlocked = false
+            State.TeamSelectionInFlight = false
             State.StatusMessage = "Equipe Piratas selecionada; aguardando personagem"
             addLog("TEAM", "Piratas selecionado automaticamente via " .. tostring(method))
             return true
@@ -586,9 +697,23 @@ local function ensurePirateTeam()
         if State.TeamSelectionAttempts == 1 or State.TeamSelectionAttempts % 5 == 0 then
             addLog("TEAM", string.format("Tentativa %d: %s", State.TeamSelectionAttempts, tostring(method)))
         end
-        task.wait(State.TeamSelectionAttempts % 10 == 0 and 5 or 1)
+        task.wait(1.5)
+    end
+    State.TeamSelectionInFlight = false
+    if not State.Unloaded and not isPirateTeam() then
+        State.TeamSelectionBlocked = true
+        State.StatusMessage = "Piratas nao selecionado; use TENTAR PIRATAS"
+        addLog("ERRO", string.format("Selecao de Piratas excedeu %ds; aguardando retry manual", TEAM_SELECTION_TIMEOUT))
     end
     return false
+end
+
+Controller.RetryPirateTeam = function()
+    if State.Unloaded or State.TeamSelectionInFlight then return false end
+    State.TeamSelectionAttempts = 0
+    State.TeamSelectionBlocked = false
+    task.spawn(ensurePirateTeam)
+    return true
 end
 
 local function isLoadingGuiVisible()
@@ -622,7 +747,20 @@ local function waitForGameReady(timeoutSeconds)
         local alive = humanoid and humanoid.Health > 0
         local hasMap = Workspace:FindFirstChild("Map") ~= nil
         local teamReady = isPirateTeam()
+        if teamReady then
+            State.PirateTeamReady = true
+            State.TeamSelectionBlocked = false
+        end
         local prerequisitesReady = game:IsLoaded() and teamReady and hasRoot and alive and hasMap
+
+        local reason = not game:IsLoaded() and "Aguardando carregamento do jogo"
+            or (not teamReady and (State.TeamSelectionBlocked
+                and "Piratas nao selecionado; use TENTAR PIRATAS" or "Aguardando selecao de Piratas"))
+            or (not hasMap and "Aguardando Workspace.Map")
+            or (not hasRoot and "Aguardando HumanoidRootPart")
+            or (not alive and "Aguardando personagem vivo")
+            or nil
+        if reason then State.StatusMessage = reason end
 
         if prerequisitesReady then
             prerequisitesSince = prerequisitesSince or os.clock()
@@ -662,6 +800,15 @@ end
 
 -- Forward declaration do Server Hop
 local doServerHop
+local saveVisitedServer
+
+local function markPendingServerFailed()
+    local serverId = State.PendingServerId
+    if serverId then
+        State.FailedServerUntil[serverId] = os.clock() + 120
+        State.PendingServerId = nil
+    end
+end
 
 if Config.AutoReconnect and GuiService then
     pcall(function()
@@ -698,6 +845,7 @@ if Config.AutoReconnect and GuiService then
                 local retryExistingHop = State.IsHopping and State.HopAttempts > 0
                 local failedToken = State.HopToken
                 State.IsHopping = true
+                markPendingServerFailed()
                 State.StatusMessage = "Erro de teleporte detectado; preparando retry"
                 addLog("WARN", "Prompt do Roblox: " .. tostring(message))
                 pcall(function() GuiService:ClearError() end)
@@ -720,6 +868,7 @@ if Config.AutoReconnect and TeleportService then
 
             local failedToken = State.HopToken
             State.IsHopping = true
+            markPendingServerFailed()
             State.StatusMessage = "Reconectando apos falha no teleporte..."
             addLog("WARN", "TeleportInitFailed: " .. tostring(result) .. " | " .. tostring(errorMessage))
             pcall(function() GuiService:ClearError() end)
@@ -737,6 +886,13 @@ pcall(function()
     trackConnection(LocalPlayer.OnTeleport:Connect(function(teleportState, placeId)
         addLog("TPSTATE", string.format("%s | place=%s | job=%s",
             tostring(teleportState), tostring(placeId), tostring(game.JobId)))
+        if teleportState == Enum.TeleportState.Started then
+            State.TeleportStarted = true
+            if State.PendingServerId and saveVisitedServer then
+                saveVisitedServer(State.PendingServerId)
+                State.PendingServerId = nil
+            end
+        end
     end))
 end)
 
@@ -978,6 +1134,10 @@ local function unload()
 
     disableNoclip()
     clearChestESP()
+    for _, connection in ipairs(State.ScannerConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(State.ScannerConnections)
     if State.CharacterDiedConnection then
         State.CharacterDiedConnection:Disconnect()
         State.CharacterDiedConnection = nil
@@ -1146,6 +1306,8 @@ local function createChestESPMarker(chestData)
         Label = label,
         Style = style,
         ChestData = chestData,
+        LastText = nil,
+        LastSelected = nil,
     }
     State.ChestESP[part] = marker
     return marker
@@ -1161,8 +1323,15 @@ local function updateChestESP()
         else
             local distance = root and (part.Position - root.Position).Magnitude or 0
             local selected = State.CurrentTarget and State.CurrentTarget.Part == part
-            marker.Box.Transparency = selected and 0.12 or 0.38
-            marker.Label.Text = string.format("%s%s  |  %.0fm", selected and "> " or "", marker.Style.Label, distance)
+            local text = string.format("%s%s  |  %.0fm", selected and "> " or "", marker.Style.Label, distance)
+            if marker.LastSelected ~= selected then
+                marker.LastSelected = selected
+                marker.Box.Transparency = selected and 0.12 or 0.38
+            end
+            if marker.LastText ~= text then
+                marker.LastText = text
+                marker.Label.Text = text
+            end
         end
     end
     for _, part in ipairs(stale) do destroyChestESPMarker(part) end
@@ -1185,6 +1354,91 @@ local function syncChestESP(chests)
     updateChestESP()
 end
 
+local function disconnectScannerConnections()
+    for _, connection in ipairs(State.ScannerConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(State.ScannerConnections)
+end
+
+local function registerChestCandidate(inst, registry)
+    if inst and inst:IsA("BasePart") and inst.Name:lower():match("^chest[123]$") then
+        local targetRegistry = registry or State.ChestRegistry
+        targetRegistry[inst] = true
+    end
+end
+
+local function addTaggedChestCandidates(registry)
+    if not CollectionService then return end
+    for _, tag in ipairs({"WorldChest", "_ChestTagged"}) do
+        pcall(function()
+            for _, inst in ipairs(CollectionService:GetTagged(tag)) do
+                registerChestCandidate(inst, registry)
+            end
+        end)
+    end
+end
+
+local function resetScannerForMap(map)
+    disconnectScannerConnections()
+    State.LastScannerMap = map
+    State.ChestRegistry = setmetatable({}, {__mode = "k"})
+    State.ScannerDescendantCount = 0
+    State.HasValidScan = false
+    State.ScannerReadyAt = nil
+    State.ConsecutiveReliableScans = 0
+    State.EmptySince = nil
+    State.EmptyScanMap = nil
+    State.EmptyScanAnchors = nil
+
+    if not map then return end
+    local descendants = map:GetDescendants()
+    State.ScannerDescendantCount = #descendants
+    for _, inst in ipairs(descendants) do registerChestCandidate(inst) end
+    addTaggedChestCandidates(State.ChestRegistry)
+    State.LastFullScannerRescan = os.clock()
+
+    table.insert(State.ScannerConnections, map.DescendantAdded:Connect(function(inst)
+        State.ScannerDescendantCount = State.ScannerDescendantCount + 1
+        registerChestCandidate(inst)
+    end))
+    table.insert(State.ScannerConnections, map.DescendantRemoving:Connect(function(inst)
+        State.ScannerDescendantCount = math.max(0, State.ScannerDescendantCount - 1)
+        State.ChestRegistry[inst] = nil
+        if State.ChestESP[inst] then destroyChestESPMarker(inst) end
+    end))
+    if CollectionService then
+        for _, tag in ipairs({"WorldChest", "_ChestTagged"}) do
+            pcall(function()
+                table.insert(State.ScannerConnections, CollectionService:GetInstanceAddedSignal(tag):Connect(function(inst)
+                    if inst:IsDescendantOf(map) then registerChestCandidate(inst) end
+                end))
+                table.insert(State.ScannerConnections, CollectionService:GetInstanceRemovedSignal(tag):Connect(function(inst)
+                    if not inst:IsDescendantOf(map) then State.ChestRegistry[inst] = nil end
+                end))
+            end)
+        end
+    end
+end
+
+local function ensureScannerRegistry(map)
+    if map ~= State.LastScannerMap then
+        resetScannerForMap(map)
+        return
+    end
+    if not map or os.clock() - State.LastFullScannerRescan < SCANNER_FULL_RESCAN_INTERVAL then return end
+
+    -- Rescan de seguranca pouco frequente para recuperar eventos perdidos sem
+    -- percorrer o mapa inteiro a cada atualizacao do HUD.
+    local refreshed = setmetatable({}, {__mode = "k"})
+    local descendants = map:GetDescendants()
+    State.ScannerDescendantCount = #descendants
+    for _, inst in ipairs(descendants) do registerChestCandidate(inst, refreshed) end
+    addTaggedChestCandidates(refreshed)
+    State.ChestRegistry = refreshed
+    State.LastFullScannerRescan = os.clock()
+end
+
 local function scanAllChests()
     local chests = {}
     local espChests = {}
@@ -1202,17 +1456,15 @@ local function scanAllChests()
     local myPos = hrp and hrp.Position or Vector3.new(0, 0, 0)
 
     local map = Workspace:FindFirstChild("Map")
-    local descendants = map and map:GetDescendants() or {}
-    if map ~= State.LastScannerMap then
-        State.LastScannerMap = map
-        State.HasValidScan = false
-        State.ScannerReadyAt = nil
-        State.ConsecutiveReliableScans = 0
-        State.EmptySince = nil
-    end
-    diagnostics.Descendants = #descendants
+    ensureScannerRegistry(map)
+    diagnostics.Descendants = State.ScannerDescendantCount
 
-    for _, desc in ipairs(descendants) do
+    local staleRegistry = {}
+    for desc in pairs(State.ChestRegistry) do
+        if not map or not desc:IsDescendantOf(map) then
+            table.insert(staleRegistry, desc)
+            continue
+        end
         if desc:IsA("BasePart") and desc.Name:lower():match("^chest[123]$") then
             diagnostics.NamedParts = diagnostics.NamedParts + 1
             diagnostics.InMap = diagnostics.InMap + 1
@@ -1257,6 +1509,7 @@ local function scanAllChests()
             table.insert(chests, chestData)
         end
     end
+    for _, desc in ipairs(staleRegistry) do State.ChestRegistry[desc] = nil end
 
     -- Coleta o bau que exige menos tempo estimado de rota, considerando subida,
     -- travessia e descida. Distancia reta so desempata rotas equivalentes.
@@ -1286,7 +1539,7 @@ local function scanAllChests()
     local signature = string.format("d=%d named=%d map=%d touch=%d active=%d cooldown=%d",
         diagnostics.Descendants, diagnostics.NamedParts, diagnostics.InMap,
         diagnostics.WithTouch, diagnostics.Active, coolingDown)
-    if signature ~= State.LastScanSignature or os.clock() - State.LastScanLogAt >= 5 then
+    if signature ~= State.LastScanSignature or os.clock() - State.LastScanLogAt >= 30 then
         State.LastScanSignature = signature
         State.LastScanLogAt = os.clock()
         addLog("SCAN", signature)
@@ -1428,9 +1681,9 @@ local function buildChestRoute(origin, finalPosition)
         local timeoutSegments = math.ceil(distance / (waypoint.Speed * Config.MovementTimeout * 0.8))
         local distanceSegments = math.ceil(distance / MAX_MOVEMENT_SEGMENT_DISTANCE)
         local count = math.max(1, timeoutSegments, distanceSegments)
-        for index = 1, count do
+        for segmentIndex = 1, count do
             table.insert(segments, {
-                Position = previous:Lerp(waypoint.Position, index / count),
+                Position = previous:Lerp(waypoint.Position, segmentIndex / count),
                 Speed = waypoint.Speed,
                 Phase = waypoint.Phase,
             })
@@ -1445,7 +1698,7 @@ local function moveToChest(part, context)
     if not root or not part or not part:IsDescendantOf(Workspace) then return false end
     local finalPosition = part.Position + Vector3.new(0, 1.5, 0)
     local route = buildChestRoute(root.Position, finalPosition)
-    for _, waypoint in ipairs(route) do
+    for index, waypoint in ipairs(route) do
         if not part:IsDescendantOf(Workspace) then return false end
         if waypoint.Phase == "descida" or waypoint.Phase == "aproximacao" then
             context.PrepareContact()
@@ -1455,8 +1708,14 @@ local function moveToChest(part, context)
             or waypoint.Speed
         State.StatusMessage = string.format("%s: %s @ %.0f/s", part.Name, waypoint.Phase, displayedSpeed)
         context.PhaseLabel = State.StatusMessage
-        addLog("MOVE", string.format("%s %s | %.1f studs @ %.0f/s", part.Name,
-            waypoint.Phase, (waypoint.Position - root.Position).Magnitude, displayedSpeed))
+        local phaseChanged = State.LastMovementLogPhase ~= waypoint.Phase
+        local logDue = phaseChanged or index == #route or os.clock() - State.LastMovementLogAt >= 4
+        if logDue then
+            State.LastMovementLogAt = os.clock()
+            State.LastMovementLogPhase = waypoint.Phase
+            addLog("MOVE", string.format("%s %s | trecho %d/%d | %.1f studs @ %.0f/s", part.Name,
+                waypoint.Phase, index, #route, (waypoint.Position - root.Position).Magnitude, displayedSpeed))
+        end
         if not moveToPosition(CFrame.new(waypoint.Position) * root.CFrame.Rotation, waypoint.Speed, context) then
             return false
         end
@@ -1491,10 +1750,17 @@ local function isChestConsumed(part, context)
     if not context.ContactStarted then return false end
     local disappeared = not part or not part:IsDescendantOf(Workspace) or not getTouchTransmitter(part)
     if not disappeared then return false end
+    context.TriggerDisappearedAt = context.TriggerDisappearedAt or os.clock()
     local beli, fragments = readPlayerBalance()
     local reward = (context.InitialBeli ~= nil and beli ~= nil and beli > context.InitialBeli)
         or (context.InitialFragments ~= nil and fragments ~= nil and fragments > context.InitialFragments)
-    if context.InitialBeli ~= nil or context.InitialFragments ~= nil then return reward end
+    if context.InitialBeli ~= nil or context.InitialFragments ~= nil then
+        if reward then return true end
+        -- O servidor pode remover o gatilho imediatamente e replicar o saldo
+        -- alguns frames depois. A remocao persistente apos contato e aceita
+        -- somente depois desta janela adicional.
+        return os.clock() - context.TriggerDisappearedAt >= Config.RewardReplicationGrace
+    end
     -- Sem Data, exige a desativacao do gatilho depois do contato, nunca durante a viagem.
     return true
 end
@@ -1509,6 +1775,8 @@ local function waitForChestConfirmation(part, context)
         if isChestConsumed(part, context) then return true end
         task.wait(0.05)
     until os.clock() >= deadline
+        and (not context.TriggerDisappearedAt
+            or os.clock() - context.TriggerDisappearedAt >= Config.RewardReplicationGrace)
     return movementIsActive(context.Character, root, humanoid, context.Token) and isChestConsumed(part, context)
 end
 
@@ -1636,13 +1904,46 @@ for jobId, visitedAt in pairs(visitedServers) do
     end
 end
 
-local function saveVisitedServer(jobId)
+saveVisitedServer = function(jobId)
+    if type(jobId) ~= "string" or jobId == "" then return end
     visitedServers[jobId] = os.time()
     pcall(function()
         if Runtime.WriteFile then
             Runtime.WriteFile(visitedServersFile, HttpService:JSONEncode(visitedServers))
         end
     end)
+end
+
+local function fetchPublicServerCandidates(placeId, currentJob)
+    local candidates = {}
+    local cursor = nil
+    for _ = 1, 3 do
+        local url = string.format(
+            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100%s",
+            tostring(placeId),
+            cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+        )
+        local ok, data = pcall(function()
+            return HttpService:JSONDecode(game:HttpGet(url))
+        end)
+        if not ok or type(data) ~= "table" then break end
+        for _, srv in ipairs(type(data.data) == "table" and data.data or {}) do
+            local failedUntil = type(srv) == "table" and State.FailedServerUntil[srv.id] or nil
+            if type(srv) == "table" and type(srv.id) == "string" and srv.id ~= currentJob
+                and type(srv.playing) == "number" and type(srv.maxPlayers) == "number"
+                and srv.playing >= 0 and srv.playing < srv.maxPlayers
+                and not visitedServers[srv.id] and (not failedUntil or failedUntil <= os.clock()) then
+                table.insert(candidates, {Id = srv.id, Playing = srv.playing})
+            end
+        end
+        cursor = data.nextPageCursor
+        if type(cursor) ~= "string" or cursor == "" then break end
+    end
+    table.sort(candidates, function(a, b)
+        if a.Playing ~= b.Playing then return a.Playing < b.Playing end
+        return a.Id < b.Id
+    end)
+    return candidates
 end
 
 doServerHop = function(reason, isRetry)
@@ -1669,6 +1970,8 @@ doServerHop = function(reason, isRetry)
     State.HopToken = State.HopToken + 1
     local hopToken = State.HopToken
     State.IsHopping = true
+    State.TeleportStarted = false
+    State.PendingServerId = nil
     State.StatusMessage = string.format("Server Hop %d/%d: %s",
         State.HopAttempts, Config.MaxHopAttempts, tostring(reason or "Meta atingida!"))
     addLog("HOP", State.StatusMessage)
@@ -1679,31 +1982,54 @@ doServerHop = function(reason, isRetry)
     if Config.PersistOnTeleport and not State.AutoExecuteQueued then
         local queueTeleport = Runtime.QueueOnTeleport
         if queueTeleport then
-            local queued = pcall(queueTeleport, [[
+            local queuePayload = [[
                 if not game:IsLoaded() then
                     game.Loaded:Wait()
                 end
                 task.wait(2)
                 pcall(function()
+                    local minimumVersion = "__AUTO_CHEST_VERSION__"
+                    local function versionAtLeast(candidate, minimum)
+                        local left, right = {}, {}
+                        for part in tostring(candidate):gmatch("%d+") do table.insert(left, tonumber(part) or 0) end
+                        for part in tostring(minimum):gmatch("%d+") do table.insert(right, tonumber(part) or 0) end
+                        for index = 1, math.max(#left, #right) do
+                            local a, b = left[index] or 0, right[index] or 0
+                            if a ~= b then return a > b end
+                        end
+                        return true
+                    end
+                    local function validSource(source)
+                        if type(source) ~= "string" or #source < 1000 or #source > 512000 then return false end
+                        if not source:find('local SCRIPT_NAME = "Auto Chest"', 1, true) then return false end
+                        local version = source:match('local%s+SCRIPT_VERSION%s*=%s*"([%d%.]+)"')
+                        return version and versionAtLeast(version, minimumVersion)
+                    end
+                    local function runSource(source)
+                        if not validSource(source) then return false end
+                        local chunk = loadstring(source)
+                        if not chunk then return false end
+                        return pcall(chunk)
+                    end
                     local url = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
                         .. "?hop=" .. tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999))
                     local fetched, source = pcall(function()
                         return game:HttpGet(url, true)
                     end)
-                    if fetched and type(source) == "string" and #source > 0 then
-                        local chunk = loadstring(source)
-                        if chunk then
-                            chunk()
-                            return
-                        end
+                    if fetched and runSource(source) then return end
+                    if isfile and readfile and isfile("AutoChest_LastKnownGood.lua") then
+                        local cached = readfile("AutoChest_LastKnownGood.lua")
+                        if runSource(cached) then return end
                     end
                     if isfile and readfile and isfile("scripts/auto_chest.lua") then
-                        loadstring(readfile("scripts/auto_chest.lua"))()
+                        if runSource(readfile("scripts/auto_chest.lua")) then return end
                     elseif isfile and readfile and isfile("auto_chest.lua") then
-                        loadstring(readfile("auto_chest.lua"))()
+                        runSource(readfile("auto_chest.lua"))
                     end
                 end)
-            ]])
+            ]]
+            queuePayload = queuePayload:gsub("__AUTO_CHEST_VERSION__", SCRIPT_VERSION)
+            local queued = pcall(queueTeleport, queuePayload)
             if queued then
                 State.AutoExecuteQueued = true
                 addLog("HOP", "Auto-execute enfileirado para o proximo servidor")
@@ -1719,29 +2045,14 @@ doServerHop = function(reason, isRetry)
 
     local placeId = game.PlaceId
     local currentJob = game.JobId
-    local url = string.format("https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100", tostring(placeId))
+    local candidates = State.HopAttempts >= 2 and fetchPublicServerCandidates(placeId, currentJob) or {}
 
-    local candidates = {}
-    pcall(function()
-        local raw = game:HttpGet(url)
-        local data = HttpService:JSONDecode(raw)
-        if data and data.data then
-            for _, srv in ipairs(data.data) do
-                if type(srv) == "table" and srv.id ~= currentJob and srv.playing and srv.maxPlayers then
-                    if srv.playing > 0 and srv.playing < srv.maxPlayers and not visitedServers[srv.id] then
-                        table.insert(candidates, srv.id)
-                    end
-                end
-            end
-        end
-    end)
-
-    -- Matchmaking padrao evita o 773. Um JobId publico especifico e usado
-    -- apenas como fallback na segunda tentativa.
+    -- Matchmaking padrao evita o 773 na primeira tentativa. Retries usam
+    -- servidores publicos diferentes, priorizando os menos cheios.
     local chosen = nil
-    if #candidates > 0 and State.HopAttempts == 2 then
-        chosen = candidates[math.random(1, #candidates)]
-        saveVisitedServer(chosen)
+    if #candidates > 0 and State.HopAttempts >= 2 then
+        chosen = candidates[1].Id
+        State.PendingServerId = chosen
     end
 
     local teleportOk, teleportError = pcall(function()
@@ -1755,6 +2066,7 @@ doServerHop = function(reason, isRetry)
     end)
 
     if not teleportOk then
+        markPendingServerFailed()
         State.IsHopping = true
         State.StatusMessage = "Falha no hop: " .. tostring(teleportError)
         if Config.AutoReconnect then
@@ -1777,6 +2089,7 @@ doServerHop = function(reason, isRetry)
         if game.JobId ~= originJob then return end
 
         State.IsHopping = false
+        markPendingServerFailed()
         addLog("WARN", string.format("Hop %d travou no loading por %ds", State.HopAttempts, Config.HopTimeout))
         doServerHop("Timeout na tela de loading", true)
     end)
@@ -1797,13 +2110,11 @@ local uiOk, uiError = pcall(function()
         Muted = Color3.fromRGB(142, 142, 151),
     }
 
-    local old = CoreGui:FindFirstChild("AutoChestHUD")
-    if old then old:Destroy() end
-    local legacyOld = CoreGui:FindFirstChild("BFAutoChestHUD")
-    if legacyOld then legacyOld:Destroy() end
+    local stalePending = CoreGui:FindFirstChild("AutoChestHUD_Pending")
+    if stalePending then stalePending:Destroy() end
 
     local sg = Instance.new("ScreenGui")
-    sg.Name = "AutoChestHUD"
+    sg.Name = "AutoChestHUD_Pending"
     sg.ResetOnSpawn = false
     sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     pcall(function()
@@ -2052,6 +2363,9 @@ local uiOk, uiError = pcall(function()
     targetStroke.Parent = targetBox
 
     local hopBtn = makeButton(226, 212, 198, "FORCAR SERVER HOP")
+    local teamRetryBtn = makeButton(226, 212, 198, "TENTAR PIRATAS")
+    teamRetryBtn.BackgroundColor3 = colors.RedDark
+    teamRetryBtn.Visible = false
 
     local logPanel = Instance.new("Frame")
     logPanel.Size = UDim2.new(1, -32, 0, 108)
@@ -2218,6 +2532,9 @@ local uiOk, uiError = pcall(function()
         State.HopAttempts = 0
         doServerHop("Acionado pelo usuario")
     end))
+    trackConnection(teamRetryBtn.MouseButton1Click:Connect(function()
+        Controller.RetryPirateTeam()
+    end))
     trackConnection(minimizeBtn.MouseButton1Click:Connect(function()
         if State.UpdateAvailable then
             Config.Minimized = false
@@ -2241,10 +2558,14 @@ local uiOk, uiError = pcall(function()
     hud.statusLbl = statusLbl
     hud.logLbl = logLbl
     hud.updatePanel = updatePanel
+    hud.hopBtn = hopBtn
+    hud.teamRetryBtn = teamRetryBtn
 end)
 
 if not uiOk then
     addLog("ERRO", "Falha ao criar UI: " .. tostring(uiError))
+    unload()
+    error("Inicializacao cancelada; instancia anterior preservada: " .. tostring(uiError))
 end
 
 -- ============================================================================
@@ -2266,8 +2587,11 @@ local queueApiAvailable = Runtime.QueueOnTeleport
 addLog("AUTOEXEC", queueApiAvailable and "queue_on_teleport detectado" or "queue_on_teleport indisponivel")
 addLog("RECONNECT", Config.AutoReconnect and "monitores de erro e TeleportInitFailed ativos" or "desligado na configuracao")
 
-task.spawn(ensurePirateTeam)
 task.spawn(function()
+    if waitForControllerActivation() then ensurePirateTeam() end
+end)
+task.spawn(function()
+    if not waitForControllerActivation() then return end
     task.wait(2)
     checkForUpdates("startup")
     while not State.Unloaded do
@@ -2277,6 +2601,7 @@ task.spawn(function()
 end)
 
 task.spawn(function()
+    if not waitForControllerActivation() then return end
     local nextESPRefresh = 0
     while not State.Unloaded do
         if hud.subtitle then
@@ -2304,6 +2629,10 @@ task.spawn(function()
         end
         if hud.logLbl then
             hud.logLbl.Text = #State.LogEntries > 0 and table.concat(State.LogEntries, "\n") or "Aguardando o primeiro scan..."
+        end
+        if hud.teamRetryBtn and hud.hopBtn then
+            hud.teamRetryBtn.Visible = State.TeamSelectionBlocked
+            hud.hopBtn.Visible = not State.TeamSelectionBlocked
         end
         if os.clock() >= nextESPRefresh then
             nextESPRefresh = os.clock() + 0.25
@@ -2431,6 +2760,7 @@ end
 
 -- Atualiza o HUD durante viagens longas; a coleta continua serial no outro loop.
 task.spawn(function()
+    if not waitForControllerActivation() then return end
     while not State.Unloaded do
         if Config.Enabled and not State.IsHopping and Workspace:FindFirstChild("Map") then
             local ok, scanError = pcall(scanAllChests)
@@ -2444,10 +2774,14 @@ task.spawn(function()
 end)
 
 task.spawn(function()
+    if not waitForControllerActivation() then return end
     task.wait(0.5)
     while not State.Unloaded and not waitForGameReady(Config.GameReadyTimeout) do
-        addLog("WARN", "Personagem ou Workspace.Map ainda nao estao prontos; hop inicial bloqueado")
-        State.StatusMessage = "Mapa incompleto; nova verificacao em 2s"
+        local reason = State.StatusMessage
+        if State.LastReadinessReason ~= reason then
+            State.LastReadinessReason = reason
+            addLog("WARN", tostring(reason) .. "; coleta e hop inicial bloqueados")
+        end
         task.wait(2)
     end
     if State.Unloaded then return end
@@ -2473,3 +2807,20 @@ task.spawn(function()
         end
     end
 end)
+
+-- Ultima operacao sincrona do arquivo: somente agora a nova instancia substitui
+-- a anterior. O updater consegue verificar Ready ao retornar do chunk.
+Controller.Ready = true
+globalEnv.AutoChestController = Controller
+if type(previousController) == "table" and previousController ~= Controller
+    and type(previousController.Unload) == "function" then
+    pcall(previousController.Unload)
+end
+for _, guiName in ipairs({"AutoChestHUD", "BFAutoChestHUD"}) do
+    pcall(function()
+        local oldGui = CoreGui:FindFirstChild(guiName)
+        if oldGui and oldGui ~= hud.Gui then oldGui:Destroy() end
+    end)
+end
+if hud.Gui then pcall(function() hud.Gui.Name = "AutoChestHUD" end) end
+State.Activated = true
