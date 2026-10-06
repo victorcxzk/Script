@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.0)
+    AUTO CHEST & SERVER HOP (v2.7.1)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,14 +27,24 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.0"
-local SCRIPT_BUILD = "2026-10-06 / reliability-and-performance"
+local SCRIPT_VERSION = "2.7.1"
+local SCRIPT_BUILD = "2026-10-06 / sea2-hop-and-travel"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
-local MAX_ADAPTIVE_TRAVEL_SPEED = 190
-local MAX_MOVEMENT_SEGMENT_DISTANCE = 120
-local RUBBERBAND_FALLBACK_SPEED = 125
+
+local SEA_1_PLACE_ID = 2753915549
+local SEA_2_PLACE_ID = 4442272183
+local SEA_3_PLACE_ID = 7449423635
+local CURRENT_PLACE_ID = game.PlaceId
+local IS_SEA_2 = CURRENT_PLACE_ID == SEA_2_PLACE_ID
+
+-- A Sea 2 tem distancias maiores entre ilhas. Usa um perfil um pouco mais rapido,
+-- mas ainda abaixo das velocidades que costumam provocar rubberband constante.
+local MAX_ADAPTIVE_TRAVEL_SPEED = IS_SEA_2 and 245 or 205
+local MAX_MOVEMENT_SEGMENT_DISTANCE = IS_SEA_2 and 180 or 140
+local RUBBERBAND_FALLBACK_SPEED = IS_SEA_2 and 165 or 140
+local STABLE_SEGMENTS_TO_RECOVER = IS_SEA_2 and 3 or 4
 local UPDATE_CHECK_INTERVAL = 60
 local AUTO_TEAM_NAME = "Pirates"
 local TEAM_SELECTION_TIMEOUT = 25
@@ -57,11 +67,11 @@ local Config = {
     ScannerWarmup = 8,              -- Impede hop antes do scanner estabilizar
     MinimumChestAnchors = 3,        -- Evita Hop enquanto o mapa ainda esta incompleto
 
-    TweenSpeed = 170,               -- Limite estavel para evitar correcoes do servidor
-    VerticalSpeed = 75,             -- Subida e descida suaves
+    TweenSpeed = IS_SEA_2 and 215 or 180, -- Sea 2 recebe cruzeiro maior; Sea 1/3 ficam conservadoras
+    VerticalSpeed = IS_SEA_2 and 95 or 80,   -- Sobe/desce mais rapido sem alterar a velocidade de contato
     MovementTimeout = 90,           -- Prazo por trecho; viagens longas sao divididas em trechos
     FinalApproachDistance = 55,     -- Alvos proximos nao fazem a rota alta completa
-    FinalApproachSpeed = 48,        -- Aproximacao estavel antes do contato controlado
+    FinalApproachSpeed = IS_SEA_2 and 68 or 55, -- Acelera apenas aproximacao/descida, nao o toque no bau
     ContactSpeed = 14,              -- Velocidade ao entrar no hitbox do bau
     ArrivalTolerance = 5,           -- Distancia maxima para considerar que chegou ao bau
 
@@ -237,7 +247,7 @@ local function normalizeSettings()
     Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 100)
     Config.MovementTimeout = math.clamp(Config.MovementTimeout, 10, 180)
     Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 80)
-    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 60)
+    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 80)
     Config.ContactSpeed = math.clamp(Config.ContactSpeed, 2, 20)
     Config.ArrivalTolerance = math.clamp(Config.ArrivalTolerance, 0.5, 8)
     Config.TouchHold = math.clamp(Config.TouchHold, 0.2, 2)
@@ -829,7 +839,10 @@ if Config.AutoReconnect and GuiService then
                 or text:find("connection", 1, true)
             )
             local isTeleportError = text ~= "" and (
-                text:find("773", 1, true)
+                text:find("769", 1, true)
+                or text:find("770", 1, true)
+                or text:find("772", 1, true)
+                or text:find("773", 1, true)
                 or text:find("restricted", 1, true)
                 or text:find("restrito", 1, true)
                 or text:find("teleport", 1, true)
@@ -1015,19 +1028,20 @@ local function prepareMotionSupport(char, root, humanoid)
     root.AssemblyLinearVelocity = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
 
-    -- Mantem a gravidade e a inercia controladas sem ancorar ou mudar a posicao.
+    -- Compensa apenas a gravidade. O antigo LinearVelocity com VectorVelocity=0
+    -- disputava com o Tween do HumanoidRootPart e podia amplificar rubberband,
+    -- principalmente em mapas mais espalhados como a Sea 2.
     local attachment = Instance.new("Attachment")
     attachment.Name = "AutoChestMotionAttachment"
     attachment.Parent = root
     State.MotionAttachment = attachment
-    local support = Instance.new("LinearVelocity")
+    local support = Instance.new("VectorForce")
     State.MotionSupport = support
     support.Name = "AutoChestMotionSupport"
     support.Attachment0 = attachment
     support.RelativeTo = Enum.ActuatorRelativeTo.World
-    support.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-    support.VectorVelocity = Vector3.zero
-    support.MaxForce = math.huge
+    support.ApplyAtCenterOfMass = true
+    support.Force = Vector3.new(0, root.AssemblyMass * Workspace.Gravity, 0)
     support.Parent = root
     ensureStanding(char)
 end
@@ -1585,7 +1599,8 @@ local function moveToPosition(targetCFrame, speed, context)
     tween:Play()
     local deadline = os.clock() + duration + 2
     local nextProgressAt = os.clock() + 1
-    local lastRemaining = distance
+    local bestRemaining = distance
+    local correctionStrikes = 0
     local rubberbanded = false
     local ok, arrived = pcall(function()
         while os.clock() < deadline do
@@ -1595,19 +1610,26 @@ local function moveToPosition(targetCFrame, speed, context)
                 context.ContactStarted = true
             end
             local currentRemaining = (root.Position - targetCFrame.Position).Magnitude
-            local correctionThreshold = math.max(15, effectiveSpeed * 0.10)
-            if currentRemaining > lastRemaining + correctionThreshold then
-                rubberbanded = true
-                State.SafeSpeedMode = true
-                State.RubberbandCorrections = State.RubberbandCorrections + 1
-                State.StableMovementSegments = 0
-                addLog("WARN", string.format(
-                    "Correcao do servidor detectada (%.1f studs); repetindo trecho a %.0f/s",
-                    currentRemaining - lastRemaining, RUBBERBAND_FALLBACK_SPEED
-                ))
-                return false
+            local correctionThreshold = math.max(18, effectiveSpeed * 0.12)
+            if currentRemaining < bestRemaining then
+                bestRemaining = currentRemaining
+                correctionStrikes = 0
+            elseif currentRemaining > bestRemaining + correctionThreshold then
+                correctionStrikes = correctionStrikes + 1
+                if correctionStrikes >= 3 then
+                    rubberbanded = true
+                    State.SafeSpeedMode = true
+                    State.RubberbandCorrections = State.RubberbandCorrections + 1
+                    State.StableMovementSegments = 0
+                    addLog("WARN", string.format(
+                        "Correcao persistente do servidor (%.1f studs); repetindo trecho a %.0f/s",
+                        currentRemaining - bestRemaining, RUBBERBAND_FALLBACK_SPEED
+                    ))
+                    return false
+                end
+            else
+                correctionStrikes = 0
             end
-            lastRemaining = currentRemaining
             if tween.PlaybackState == Enum.PlaybackState.Completed then
                 local remaining = currentRemaining
                 if remaining > Config.ArrivalTolerance then
@@ -1621,7 +1643,7 @@ local function moveToPosition(targetCFrame, speed, context)
                 end
                 if State.SafeSpeedMode then
                     State.StableMovementSegments = State.StableMovementSegments + 1
-                    if State.StableMovementSegments >= 6 then
+                    if State.StableMovementSegments >= STABLE_SEGMENTS_TO_RECOVER then
                         State.SafeSpeedMode = false
                         State.StableMovementSegments = 0
                         addLog("MOVE", "Movimento estabilizado; velocidade normal restaurada")
@@ -1917,9 +1939,9 @@ end
 local function fetchPublicServerCandidates(placeId, currentJob)
     local candidates = {}
     local cursor = nil
-    for _ = 1, 3 do
+    for _ = 1, 5 do
         local url = string.format(
-            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100%s",
+            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true%s",
             tostring(placeId),
             cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
         )
@@ -2045,24 +2067,46 @@ doServerHop = function(reason, isRetry)
 
     local placeId = game.PlaceId
     local currentJob = game.JobId
-    local candidates = State.HopAttempts >= 2 and fetchPublicServerCandidates(placeId, currentJob) or {}
 
-    -- Matchmaking padrao evita o 773 na primeira tentativa. Retries usam
-    -- servidores publicos diferentes, priorizando os menos cheios.
-    local chosen = nil
-    if #candidates > 0 and State.HopAttempts >= 2 then
-        chosen = candidates[1].Id
-        State.PendingServerId = chosen
+    -- Server hop real desde a primeira tentativa: seleciona explicitamente outro
+    -- JobId do MESMO PlaceId. Isso evita depender do matchmaking generico, que
+    -- pode falhar em sub-places (ex.: Sea 2) e exibir prompt 773/restricted.
+    local candidates = fetchPublicServerCandidates(placeId, currentJob)
+    if #candidates == 0 then
+        -- Se o TTL esgotou o pool, libera somente os visitados antigos e tenta
+        -- novamente. O servidor atual continua excluido pelo currentJob.
+        local hadVisited = next(visitedServers) ~= nil
+        if hadVisited then
+            for jobId in pairs(visitedServers) do
+                if jobId ~= currentJob then
+                    visitedServers[jobId] = nil
+                end
+            end
+            candidates = fetchPublicServerCandidates(placeId, currentJob)
+        end
     end
 
-    local teleportOk, teleportError = pcall(function()
-        if chosen then
-            addLog("HOP", "Tentando servidor " .. tostring(chosen))
-            TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
+    local chosen = candidates[1] and candidates[1].Id or nil
+    if not chosen then
+        State.IsHopping = false
+        State.StatusMessage = "Nenhum servidor publico elegivel encontrado; tentando novamente..."
+        addLog("WARN", "API de servidores nao retornou JobId elegivel para place " .. tostring(placeId))
+        if Config.AutoReconnect and State.HopAttempts < Config.MaxHopAttempts then
+            task.delay(2, function()
+                if not State.Unloaded and State.HopToken == hopToken and doServerHop then
+                    doServerHop("Nova consulta de servidores publicos", true)
+                end
+            end)
         else
-            addLog("HOP", "Usando matchmaking padrao do Roblox")
-            TeleportService:Teleport(placeId, LocalPlayer)
+            State.HopBlocked = true
         end
+        return
+    end
+
+    State.PendingServerId = chosen
+    local teleportOk, teleportError = pcall(function()
+        addLog("HOP", "Tentando servidor publico " .. tostring(chosen))
+        TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
     end)
 
     if not teleportOk then
