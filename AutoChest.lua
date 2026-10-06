@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.5.0)
+    AUTO CHEST & SERVER HOP (v2.6.0)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,11 +27,13 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.5.0"
-local SCRIPT_BUILD = "2026-10-06 / adaptive-express-routing"
+local SCRIPT_VERSION = "2.6.0"
+local SCRIPT_BUILD = "2026-10-06 / live-updater-auto-pirates"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 3
 local MAX_ADAPTIVE_TRAVEL_SPEED = 320
+local UPDATE_CHECK_INTERVAL = 60
+local AUTO_TEAM_NAME = "Pirates"
 
 -- ============================================================================
 -- 1. CONFIGURACOES DO USUARIO
@@ -113,6 +115,8 @@ local Runtime = {
     GetHui = runtimeValue("gethui"),
     GetGlobalEnvironment = runtimeValue("getgenv"),
     FireTouchInterest = runtimeValue("firetouchinterest"),
+    FireSignal = runtimeValue("firesignal"),
+    LoadString = runtimeValue("loadstring"),
     QueueOnTeleport = runtimeValue("queue_on_teleport")
         or runtimeValue("queueonteleport")
         or (type(synRuntime) == "table" and synRuntime.queue_on_teleport)
@@ -134,6 +138,7 @@ end
 
 local Players = safeService("Players")
 local Workspace = safeService("Workspace")
+local ReplicatedStorage = safeService("ReplicatedStorage")
 local TweenService = safeService("TweenService")
 local RunService = safeService("RunService")
 local HttpService = safeService("HttpService")
@@ -142,6 +147,7 @@ local GuiService = safeService("GuiService")
 local CoreGui = safeService("CoreGui")
 local VirtualUser = safeService("VirtualUser")
 local UserInputService = safeService("UserInputService")
+local VirtualInputManager = safeService("VirtualInputManager")
 
 local settingsFile = "AutoChest_Settings.json"
 local legacySettingsFile = "BF_AutoChest_Settings.json"
@@ -309,6 +315,14 @@ local State = {
     WasSeated = false,
     ChestESP = {},
     ESPContainer = nil,
+    UpdateAvailable = false,
+    UpdateCheckInFlight = false,
+    UpdateApplying = false,
+    RemoteVersion = nil,
+    RemoteSource = nil,
+    LastUpdateError = nil,
+    TeamSelectionAttempts = 0,
+    PirateTeamReady = false,
 }
 
 local hud = {}
@@ -357,6 +371,111 @@ local function addLog(level, message)
     end
 end
 
+local function isVersionNewer(candidate, current)
+    local candidateParts = {}
+    local currentParts = {}
+    for part in tostring(candidate):gmatch("%d+") do table.insert(candidateParts, tonumber(part) or 0) end
+    for part in tostring(current):gmatch("%d+") do table.insert(currentParts, tonumber(part) or 0) end
+    local count = math.max(#candidateParts, #currentParts)
+    for index = 1, count do
+        local left = candidateParts[index] or 0
+        local right = currentParts[index] or 0
+        if left ~= right then return left > right end
+    end
+    return false
+end
+
+local function extractRemoteVersion(source)
+    if type(source) ~= "string" or #source < 1000 then return nil end
+    if not source:find('local SCRIPT_NAME = "Auto Chest"', 1, true) then return nil end
+    return source:match('local%s+SCRIPT_VERSION%s*=%s*"([%d%.]+)"')
+end
+
+local function updateURL(reason)
+    return string.format("%s?source=%s&time=%d&nonce=%d", RAW_SCRIPT_URL,
+        tostring(reason or "runtime"), os.time(), math.random(100000, 999999))
+end
+
+local function checkForUpdates(reason)
+    if State.Unloaded or State.UpdateCheckInFlight or State.UpdateApplying then return false end
+    State.UpdateCheckInFlight = true
+    local fetched, source = pcall(function()
+        return game:HttpGet(updateURL(reason), true)
+    end)
+    State.UpdateCheckInFlight = false
+
+    if not fetched then
+        local message = "Falha ao consultar atualizacao: " .. tostring(source)
+        if State.LastUpdateError ~= message then
+            State.LastUpdateError = message
+            addLog("WARN", message)
+        end
+        return false
+    end
+
+    local remoteVersion = extractRemoteVersion(source)
+    if not remoteVersion then
+        local message = "Resposta de atualizacao invalida; versao atual mantida"
+        if State.LastUpdateError ~= message then
+            State.LastUpdateError = message
+            addLog("WARN", message)
+        end
+        return false
+    end
+
+    State.LastUpdateError = nil
+    if isVersionNewer(remoteVersion, SCRIPT_VERSION) then
+        State.UpdateAvailable = true
+        State.RemoteVersion = remoteVersion
+        State.RemoteSource = source
+        State.StatusMessage = string.format("ATUALIZACAO v%s DISPONIVEL", remoteVersion)
+        addLog("UPDATE", string.format("Nova versao v%s detectada; aguardando confirmacao", remoteVersion))
+        if hud.ShowUpdate then hud.ShowUpdate(remoteVersion) end
+        return true
+    end
+
+    if reason == "startup" then
+        addLog("UPDATE", string.format("v%s e a versao mais recente", SCRIPT_VERSION))
+    end
+    return false
+end
+
+local function applyAvailableUpdate()
+    if State.UpdateApplying then return end
+    if not State.UpdateAvailable or not State.RemoteSource or not State.RemoteVersion then
+        addLog("WARN", "Nenhuma atualizacao valida esta pronta para instalar")
+        return
+    end
+    if type(Runtime.LoadString) ~= "function" then
+        State.StatusMessage = "Executor sem loadstring; reexecute pelo link atualizado"
+        addLog("ERRO", "loadstring indisponivel para aplicar a atualizacao")
+        return
+    end
+
+    local chunk, compileError = Runtime.LoadString(State.RemoteSource)
+    if type(chunk) ~= "function" then
+        State.StatusMessage = "Falha ao validar a atualizacao"
+        addLog("ERRO", "Atualizacao recusada pelo compilador: " .. tostring(compileError))
+        return
+    end
+
+    State.UpdateApplying = true
+    State.SettingsPersisted = saveSettings()
+    State.StatusMessage = string.format("Aplicando atualizacao v%s...", State.RemoteVersion)
+    addLog("UPDATE", State.StatusMessage)
+    task.defer(function()
+        local ok, runtimeError = pcall(chunk)
+        if not ok and not State.Unloaded then
+            State.UpdateApplying = false
+            State.StatusMessage = "Falha ao aplicar atualizacao; versao atual preservada"
+            addLog("ERRO", "Atualizacao falhou: " .. tostring(runtimeError))
+        end
+    end)
+end
+
+Controller.CheckForUpdates = checkForUpdates
+Controller.ApplyUpdate = applyAvailableUpdate
+
 local function getCharacter(timeoutSeconds)
     local deadline = os.clock() + (timeoutSeconds or 10)
     repeat
@@ -379,6 +498,84 @@ end
 local function getHumanoid(char)
     char = char or getCharacter()
     return char and char:FindFirstChildWhichIsA("Humanoid") or nil
+end
+
+local function isPirateTeam()
+    local team = LocalPlayer.Team
+    return team ~= nil and team.Name:lower() == AUTO_TEAM_NAME:lower()
+end
+
+local function findPiratesButton()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    local chooseTeam = playerGui and playerGui:FindFirstChild("ChooseTeam", true)
+    local container = chooseTeam and chooseTeam:FindFirstChild("Container")
+    local pirates = container and container:FindFirstChild(AUTO_TEAM_NAME)
+    return pirates and pirates:FindFirstChildWhichIsA("TextButton", true) or nil
+end
+
+local function activatePiratesButton()
+    local button = findPiratesButton()
+    if not button then return false end
+
+    if type(Runtime.FireSignal) == "function" then
+        local fired = pcall(Runtime.FireSignal, button.Activated)
+        if fired then return true end
+    end
+
+    if VirtualInputManager then
+        local center = button.AbsolutePosition + button.AbsoluteSize * 0.5
+        return pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
+            VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0)
+        end)
+    end
+    return false
+end
+
+local function requestPirateTeam()
+    if isPirateTeam() then return true, "ja selecionado" end
+
+    local remotes = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Remotes")
+    local comm = remotes and remotes:FindFirstChild("CommF_")
+    if comm and comm:IsA("RemoteFunction") then
+        pcall(function()
+            comm:InvokeServer("SetTeam", AUTO_TEAM_NAME)
+        end)
+        task.wait(0.25)
+        if isPirateTeam() then return true, "CommF_ SetTeam" end
+    end
+
+    local clicked = activatePiratesButton()
+    if clicked then
+        task.wait(0.25)
+        if isPirateTeam() then return true, "botao ChooseTeam" end
+    end
+    return false, clicked and "aguardando confirmacao da interface" or "interface ainda indisponivel"
+end
+
+local function ensurePirateTeam()
+    if isPirateTeam() then
+        State.PirateTeamReady = true
+        addLog("TEAM", "Piratas ja estava selecionado")
+        return true
+    end
+
+    while not State.Unloaded and not isPirateTeam() do
+        State.TeamSelectionAttempts = State.TeamSelectionAttempts + 1
+        State.StatusMessage = string.format("Selecionando Piratas... tentativa %d", State.TeamSelectionAttempts)
+        local selected, method = requestPirateTeam()
+        if selected then
+            State.PirateTeamReady = true
+            State.StatusMessage = "Equipe Piratas selecionada; aguardando personagem"
+            addLog("TEAM", "Piratas selecionado automaticamente via " .. tostring(method))
+            return true
+        end
+        if State.TeamSelectionAttempts == 1 or State.TeamSelectionAttempts % 5 == 0 then
+            addLog("TEAM", string.format("Tentativa %d: %s", State.TeamSelectionAttempts, tostring(method)))
+        end
+        task.wait(State.TeamSelectionAttempts % 10 == 0 and 5 or 1)
+    end
+    return false
 end
 
 local function isLoadingGuiVisible()
@@ -411,7 +608,8 @@ local function waitForGameReady(timeoutSeconds)
         local hasRoot = char and char:FindFirstChild("HumanoidRootPart") ~= nil
         local alive = humanoid and humanoid.Health > 0
         local hasMap = Workspace:FindFirstChild("Map") ~= nil
-        local prerequisitesReady = game:IsLoaded() and hasRoot and alive and hasMap
+        local teamReady = isPirateTeam()
+        local prerequisitesReady = game:IsLoaded() and teamReady and hasRoot and alive and hasMap
 
         if prerequisitesReady then
             prerequisitesSince = prerequisitesSince or os.clock()
@@ -1431,8 +1629,9 @@ doServerHop = function(reason, isRetry)
                 task.wait(2)
                 pcall(function()
                     local url = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
+                        .. "?hop=" .. tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999))
                     local fetched, source = pcall(function()
-                        return game:HttpGet(url)
+                        return game:HttpGet(url, true)
                     end)
                     if fetched and type(source) == "string" and #source > 0 then
                         local chunk = loadstring(source)
@@ -1833,6 +2032,92 @@ local uiOk, uiError = pcall(function()
     logLbl.TextTruncate = Enum.TextTruncate.AtEnd
     logLbl.Parent = logPanel
 
+    -- Modal de atualizacao: cobre os controles para que a nova versao nunca
+    -- passe despercebida, mesmo se o menu estava minimizado.
+    local updatePanel = Instance.new("Frame")
+    updatePanel.Name = "UpdateAvailable"
+    updatePanel.Size = UDim2.fromOffset(408, 248)
+    updatePanel.Position = UDim2.fromOffset(16, 116)
+    updatePanel.BackgroundColor3 = colors.Black
+    updatePanel.BorderSizePixel = 0
+    updatePanel.Visible = false
+    updatePanel.ZIndex = 40
+    updatePanel.Parent = card
+    local updateStroke = Instance.new("UIStroke")
+    updateStroke.Color = colors.Red
+    updateStroke.Thickness = 2
+    updateStroke.Parent = updatePanel
+    local updateCorner = Instance.new("UICorner")
+    updateCorner.CornerRadius = UDim.new(0, 5)
+    updateCorner.Parent = updatePanel
+
+    local updateTitle = Instance.new("TextLabel")
+    updateTitle.Size = UDim2.new(1, -24, 0, 34)
+    updateTitle.Position = UDim2.fromOffset(12, 12)
+    updateTitle.BackgroundTransparency = 1
+    updateTitle.Text = "ATUALIZACAO DISPONIVEL"
+    updateTitle.TextColor3 = colors.Red
+    updateTitle.Font = Enum.Font.GothamBold
+    updateTitle.TextSize = 17
+    updateTitle.TextXAlignment = Enum.TextXAlignment.Left
+    updateTitle.ZIndex = 41
+    updateTitle.Parent = updatePanel
+
+    local updateInfo = Instance.new("TextLabel")
+    updateInfo.Size = UDim2.new(1, -24, 0, 100)
+    updateInfo.Position = UDim2.fromOffset(12, 50)
+    updateInfo.BackgroundTransparency = 1
+    updateInfo.Text = "Uma nova versao do Auto Chest esta pronta. A coleta sera retomada automaticamente depois da atualizacao."
+    updateInfo.TextColor3 = colors.White
+    updateInfo.Font = Enum.Font.GothamMedium
+    updateInfo.TextSize = 12
+    updateInfo.TextWrapped = true
+    updateInfo.TextXAlignment = Enum.TextXAlignment.Left
+    updateInfo.TextYAlignment = Enum.TextYAlignment.Top
+    updateInfo.ZIndex = 41
+    updateInfo.Parent = updatePanel
+
+    local updateBtn = Instance.new("TextButton")
+    updateBtn.Size = UDim2.new(1, -24, 0, 48)
+    updateBtn.Position = UDim2.fromOffset(12, 184)
+    updateBtn.BackgroundColor3 = colors.RedDark
+    updateBtn.BorderSizePixel = 0
+    updateBtn.Text = "ATUALIZAR AGORA"
+    updateBtn.TextColor3 = colors.White
+    updateBtn.Font = Enum.Font.GothamBold
+    updateBtn.TextSize = 13
+    updateBtn.ZIndex = 41
+    updateBtn.Parent = updatePanel
+    local updateBtnCorner = Instance.new("UICorner")
+    updateBtnCorner.CornerRadius = UDim.new(0, 4)
+    updateBtnCorner.Parent = updateBtn
+    local updateBtnStroke = Instance.new("UIStroke")
+    updateBtnStroke.Color = colors.Red
+    updateBtnStroke.Thickness = 1
+    updateBtnStroke.Parent = updateBtn
+
+    hud.ShowUpdate = function(version)
+        Config.Minimized = false
+        card.Size = UDim2.fromOffset(440, 376)
+        minimizeBtn.Text = "-"
+        updateTitle.Text = string.format("ATUALIZACAO v%s DISPONIVEL", tostring(version))
+        updateInfo.Text = string.format(
+            "Voce esta usando a v%s. A v%s ja foi encontrada no GitHub. Clique abaixo para recarregar o script sem esperar o proximo hop.",
+            SCRIPT_VERSION, tostring(version)
+        )
+        updateBtn.Text = string.format("ATUALIZAR PARA v%s AGORA", tostring(version))
+        updateBtn.Active = true
+        updatePanel.Visible = true
+    end
+
+    trackConnection(updateBtn.MouseButton1Click:Connect(function()
+        if State.UpdateApplying then return end
+        updateBtn.Text = "VALIDANDO E ATUALIZANDO..."
+        updateBtn.Active = false
+        applyAvailableUpdate()
+        if not State.UpdateApplying then updateBtn.Active = true end
+    end))
+
     trackConnection(toggleBtn.MouseButton1Click:Connect(function()
         Config.Enabled = not Config.Enabled
         toggleBtn.Text = Config.Enabled and "AUTO-CHEST  /  ON" or "AUTO-CHEST  /  OFF"
@@ -1877,6 +2162,13 @@ local uiOk, uiError = pcall(function()
         doServerHop("Acionado pelo usuario")
     end))
     trackConnection(minimizeBtn.MouseButton1Click:Connect(function()
+        if State.UpdateAvailable then
+            Config.Minimized = false
+            minimizeBtn.Text = "-"
+            card.Size = UDim2.fromOffset(440, 376)
+            addLog("UPDATE", "Atualizacao pendente; aviso mantido aberto")
+            return
+        end
         Config.Minimized = not Config.Minimized
         minimizeBtn.Text = Config.Minimized and "+" or "-"
         card.Size = Config.Minimized and UDim2.fromOffset(440, 54) or UDim2.fromOffset(440, 376)
@@ -1891,6 +2183,7 @@ local uiOk, uiError = pcall(function()
     hud.scanValue = scanValue
     hud.statusLbl = statusLbl
     hud.logLbl = logLbl
+    hud.updatePanel = updatePanel
 end)
 
 if not uiOk then
@@ -1907,11 +2200,23 @@ addLog("BOOT", "Scanner baseado no dump: Workspace.Map + Chest1/2/3 + TouchTrans
 addLog("MOVE", string.format("Modo expresso | viagem=%.0f-%.0f/s vertical=%.0f/s contato=%.0f/s",
     Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.VerticalSpeed, Config.ContactSpeed))
 addLog("ESP", "Sempre ativo | bronze=laranja prata=claro ouro=amarelo")
+addLog("TEAM", "Selecao automatica de Piratas ativa apos execute e server hop")
+addLog("UPDATE", string.format("Verificacao automatica a cada %ds", UPDATE_CHECK_INTERVAL))
 State.SettingsPersisted = saveSettings()
 addLog("SETTINGS", settingsLoadMessage .. (State.SettingsPersisted and " | persistencia OK" or " | falha ao salvar"))
 local queueApiAvailable = Runtime.QueueOnTeleport
 addLog("AUTOEXEC", queueApiAvailable and "queue_on_teleport detectado" or "queue_on_teleport indisponivel")
 addLog("RECONNECT", Config.AutoReconnect and "monitores de erro e TeleportInitFailed ativos" or "desligado na configuracao")
+
+task.spawn(ensurePirateTeam)
+task.spawn(function()
+    task.wait(2)
+    checkForUpdates("startup")
+    while not State.Unloaded do
+        task.wait(UPDATE_CHECK_INTERVAL)
+        if not State.Unloaded then checkForUpdates("periodic") end
+    end
+end)
 
 task.spawn(function()
     local nextESPRefresh = 0
