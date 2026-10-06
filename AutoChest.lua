@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.6.0)
+    AUTO CHEST & SERVER HOP (v2.6.1)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,11 +27,13 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.6.0"
-local SCRIPT_BUILD = "2026-10-06 / live-updater-auto-pirates"
+local SCRIPT_VERSION = "2.6.1"
+local SCRIPT_BUILD = "2026-10-06 / stable-segmented-motion"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
-local SETTINGS_SCHEMA = 3
-local MAX_ADAPTIVE_TRAVEL_SPEED = 320
+local SETTINGS_SCHEMA = 4
+local MAX_ADAPTIVE_TRAVEL_SPEED = 190
+local MAX_MOVEMENT_SEGMENT_DISTANCE = 120
+local RUBBERBAND_FALLBACK_SPEED = 125
 local UPDATE_CHECK_INTERVAL = 60
 local AUTO_TEAM_NAME = "Pirates"
 
@@ -48,11 +50,11 @@ local Config = {
     ScannerWarmup = 8,              -- Impede hop antes do scanner estabilizar
     MinimumChestAnchors = 3,        -- Evita Hop enquanto o mapa ainda esta incompleto
 
-    TweenSpeed = 240,               -- Velocidade base; viagens longas aceleram progressivamente
-    VerticalSpeed = 105,            -- Subida e descida rapidas, ainda continuas
+    TweenSpeed = 170,               -- Limite estavel para evitar correcoes do servidor
+    VerticalSpeed = 75,             -- Subida e descida suaves
     MovementTimeout = 90,           -- Prazo por trecho; viagens longas sao divididas em trechos
-    FinalApproachDistance = 70,     -- Alvos proximos nao fazem a rota alta completa
-    FinalApproachSpeed = 65,        -- Aproximacao rapida antes do contato controlado
+    FinalApproachDistance = 55,     -- Alvos proximos nao fazem a rota alta completa
+    FinalApproachSpeed = 48,        -- Aproximacao estavel antes do contato controlado
     ContactSpeed = 14,              -- Velocidade ao entrar no hitbox do bau
     ArrivalTolerance = 5,           -- Distancia maxima para considerar que chegou ao bau
 
@@ -191,6 +193,14 @@ local function loadSettings()
         if Config.FinalApproachDistance == 55 then Config.FinalApproachDistance = 70 end
         if Config.FinalApproachSpeed == 55 then Config.FinalApproachSpeed = 65 end
     end
+    -- A v2.5/v2.6 excedia o limite pratico de alguns servidores e causava
+    -- rubberband (correcoes que pareciam TP). Migra esses valores para o perfil estavel.
+    if savedSchema < 4 then
+        if Config.TweenSpeed == 240 then Config.TweenSpeed = 170 end
+        if Config.VerticalSpeed == 105 then Config.VerticalSpeed = 75 end
+        if Config.FinalApproachDistance == 70 then Config.FinalApproachDistance = 55 end
+        if Config.FinalApproachSpeed == 65 then Config.FinalApproachSpeed = 48 end
+    end
     settingsLoadMessage = string.format("%d configuracoes restauradas%s", applied,
         loadedFile == legacySettingsFile and " (configuracoes antigas migradas)" or "")
 end
@@ -218,11 +228,11 @@ local function normalizeSettings()
     Config.LoadingGuiSoftTimeout = math.clamp(tonumber(Config.LoadingGuiSoftTimeout) or 4, 1, 8)
     Config.ScannerWarmup = math.clamp(tonumber(Config.ScannerWarmup) or 8, 3, 30)
     Config.SafeTravelHeight = math.clamp(tonumber(Config.SafeTravelHeight) or 45, 20, 150)
-    Config.TweenSpeed = math.clamp(Config.TweenSpeed, 20, 280)
-    Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 140)
+    Config.TweenSpeed = math.clamp(Config.TweenSpeed, 20, 210)
+    Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 100)
     Config.MovementTimeout = math.clamp(Config.MovementTimeout, 10, 180)
-    Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 110)
-    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 90)
+    Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 80)
+    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 60)
     Config.ContactSpeed = math.clamp(Config.ContactSpeed, 2, 20)
     Config.ArrivalTolerance = math.clamp(Config.ArrivalTolerance, 0.5, 3)
     Config.TouchHold = math.clamp(Config.TouchHold, 0.2, 2)
@@ -323,6 +333,9 @@ local State = {
     LastUpdateError = nil,
     TeamSelectionAttempts = 0,
     PirateTeamReady = false,
+    SafeSpeedMode = false,
+    RubberbandCorrections = 0,
+    StableMovementSegments = 0,
 }
 
 local hud = {}
@@ -1037,10 +1050,10 @@ local function isValidChest(inst)
 end
 
 local function getAdaptiveTravelSpeed(distance)
-    -- Mantem a velocidade base em percursos comuns e adiciona ate 80 studs/s
-    -- em viagens longas. O contato com o bau nao usa este boost.
+    -- Boost conservador: o teto anterior de 320 causava correcoes do servidor.
+    -- O contato com o bau nao usa este boost.
     local boostRatio = math.clamp((distance - 250) / 1750, 0, 1)
-    return math.min(Config.TweenSpeed + boostRatio * 80, MAX_ADAPTIVE_TRAVEL_SPEED)
+    return math.min(Config.TweenSpeed + boostRatio * 20, MAX_ADAPTIVE_TRAVEL_SPEED)
 end
 
 local function estimateChestTravelTime(origin, target)
@@ -1304,7 +1317,11 @@ local function moveToPosition(targetCFrame, speed, context)
     prepareMotionSupport(char, root, humanoid)
     local distance = (targetCFrame.Position - root.Position).Magnitude
     if distance <= 0.15 then return true end
-    local duration = math.max(distance / math.max(speed or Config.TweenSpeed, 1), 0.05)
+    local requestedSpeed = speed or Config.TweenSpeed
+    local effectiveSpeed = State.SafeSpeedMode
+        and math.min(requestedSpeed, RUBBERBAND_FALLBACK_SPEED)
+        or requestedSpeed
+    local duration = math.max(distance / math.max(effectiveSpeed, 1), 0.05)
     if duration > Config.MovementTimeout then
         addLog("WARN", string.format("Trecho requer %.1fs; limite=%ds, alvo adiado", duration, Config.MovementTimeout))
         return false
@@ -1315,6 +1332,8 @@ local function moveToPosition(targetCFrame, speed, context)
     tween:Play()
     local deadline = os.clock() + duration + 2
     local nextProgressAt = os.clock() + 1
+    local lastRemaining = distance
+    local rubberbanded = false
     local ok, arrived = pcall(function()
         while os.clock() < deadline do
             if not movementIsActive(char, root, humanoid, token) then return false end
@@ -1322,12 +1341,38 @@ local function moveToPosition(targetCFrame, speed, context)
                 and (root.Position - context.ContactPosition).Magnitude <= 3.5 then
                 context.ContactStarted = true
             end
+            local currentRemaining = (root.Position - targetCFrame.Position).Magnitude
+            local correctionThreshold = math.max(15, effectiveSpeed * 0.10)
+            if currentRemaining > lastRemaining + correctionThreshold then
+                rubberbanded = true
+                State.SafeSpeedMode = true
+                State.RubberbandCorrections = State.RubberbandCorrections + 1
+                State.StableMovementSegments = 0
+                addLog("WARN", string.format(
+                    "Correcao do servidor detectada (%.1f studs); repetindo trecho a %.0f/s",
+                    currentRemaining - lastRemaining, RUBBERBAND_FALLBACK_SPEED
+                ))
+                return false
+            end
+            lastRemaining = currentRemaining
             if tween.PlaybackState == Enum.PlaybackState.Completed then
-                local remaining = (root.Position - targetCFrame.Position).Magnitude
+                local remaining = currentRemaining
                 if remaining > Config.ArrivalTolerance then
+                    rubberbanded = true
+                    State.SafeSpeedMode = true
+                    State.RubberbandCorrections = State.RubberbandCorrections + 1
+                    State.StableMovementSegments = 0
                     addLog("WARN", string.format("Tween terminou fora do alvo: %.1f studs | Y=%.1f HP=%.1f",
                         remaining, root.Position.Y, humanoid.Health))
                     return false
+                end
+                if State.SafeSpeedMode then
+                    State.StableMovementSegments = State.StableMovementSegments + 1
+                    if State.StableMovementSegments >= 6 then
+                        State.SafeSpeedMode = false
+                        State.StableMovementSegments = 0
+                        addLog("MOVE", "Movimento estabilizado; velocidade normal restaurada")
+                    end
                 end
                 return true
             end
@@ -1346,6 +1391,13 @@ local function moveToPosition(targetCFrame, speed, context)
     if State.CurrentTween == tween then State.CurrentTween = nil end
     tween:Destroy()
     if not ok then error(arrived) end
+    if rubberbanded and context and not context.RubberbandRetryActive
+        and movementIsActive(char, root, humanoid, token) then
+        context.RubberbandRetryActive = true
+        local recovered = moveToPosition(targetCFrame, RUBBERBAND_FALLBACK_SPEED, context)
+        context.RubberbandRetryActive = false
+        return recovered
+    end
     return arrived
 end
 
@@ -1362,7 +1414,7 @@ local function buildChestRoute(origin, finalPosition)
         local cruiseSpeed = getAdaptiveTravelSpeed(horizontalDistance)
         route = {
             {Position = Vector3.new(origin.X, clearance, origin.Z), Speed = Config.VerticalSpeed, Phase = "subida"},
-            {Position = Vector3.new(finalPosition.X, clearance, finalPosition.Z), Speed = cruiseSpeed, Phase = "travessia expressa"},
+            {Position = Vector3.new(finalPosition.X, clearance, finalPosition.Z), Speed = cruiseSpeed, Phase = "travessia estavel"},
             {Position = finalPosition, Speed = Config.FinalApproachSpeed, Phase = "descida"},
         }
     end
@@ -1373,7 +1425,9 @@ local function buildChestRoute(origin, finalPosition)
     local previous = origin
     for _, waypoint in ipairs(route) do
         local distance = (waypoint.Position - previous).Magnitude
-        local count = math.max(1, math.ceil(distance / (waypoint.Speed * Config.MovementTimeout * 0.8)))
+        local timeoutSegments = math.ceil(distance / (waypoint.Speed * Config.MovementTimeout * 0.8))
+        local distanceSegments = math.ceil(distance / MAX_MOVEMENT_SEGMENT_DISTANCE)
+        local count = math.max(1, timeoutSegments, distanceSegments)
         for index = 1, count do
             table.insert(segments, {
                 Position = previous:Lerp(waypoint.Position, index / count),
@@ -1396,10 +1450,13 @@ local function moveToChest(part, context)
         if waypoint.Phase == "descida" or waypoint.Phase == "aproximacao" then
             context.PrepareContact()
         end
-        State.StatusMessage = string.format("%s: %s @ %.0f/s", part.Name, waypoint.Phase, waypoint.Speed)
+        local displayedSpeed = State.SafeSpeedMode
+            and math.min(waypoint.Speed, RUBBERBAND_FALLBACK_SPEED)
+            or waypoint.Speed
+        State.StatusMessage = string.format("%s: %s @ %.0f/s", part.Name, waypoint.Phase, displayedSpeed)
         context.PhaseLabel = State.StatusMessage
         addLog("MOVE", string.format("%s %s | %.1f studs @ %.0f/s", part.Name,
-            waypoint.Phase, (waypoint.Position - root.Position).Magnitude, waypoint.Speed))
+            waypoint.Phase, (waypoint.Position - root.Position).Magnitude, displayedSpeed))
         if not moveToPosition(CFrame.new(waypoint.Position) * root.CFrame.Rotation, waypoint.Speed, context) then
             return false
         end
@@ -2197,8 +2254,9 @@ addLog("BOOT", string.format("%s v%s | build %s | place=%s | job=%s",
     SCRIPT_NAME, SCRIPT_VERSION, SCRIPT_BUILD, tostring(game.PlaceId), tostring(game.JobId)))
 addLog("SOURCE", RAW_SCRIPT_URL)
 addLog("BOOT", "Scanner baseado no dump: Workspace.Map + Chest1/2/3 + TouchTransmitter")
-addLog("MOVE", string.format("Modo expresso | viagem=%.0f-%.0f/s vertical=%.0f/s contato=%.0f/s",
-    Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.VerticalSpeed, Config.ContactSpeed))
+addLog("MOVE", string.format("Perfil estavel | viagem=%.0f-%.0f/s vertical=%.0f/s contato=%.0f/s trecho<=%d",
+    Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.VerticalSpeed, Config.ContactSpeed,
+    MAX_MOVEMENT_SEGMENT_DISTANCE))
 addLog("ESP", "Sempre ativo | bronze=laranja prata=claro ouro=amarelo")
 addLog("TEAM", "Selecao automatica de Piratas ativa apos execute e server hop")
 addLog("UPDATE", string.format("Verificacao automatica a cada %ds", UPDATE_CHECK_INTERVAL))
