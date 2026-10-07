@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.7)
+    AUTO CHEST & SERVER HOP (v2.7.8)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,28 +27,32 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.7"
-local SCRIPT_BUILD = "2026-10-06 / sticky-target-stealth-ui-bootstrap-update"
+local SCRIPT_VERSION = "2.7.8"
+local SCRIPT_BUILD = "2026-10-06 / persistent-speed-calibration-needle-ui"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
 
 local SEA_2_PLACE_ID = 4442272183
 local SEA_PROFILES = {
-    [2753915549] = {BaseSpeed = 215, MaxSpeed = 250, SegmentDistance = 230, FallbackSpeed = 160},
-    [SEA_2_PLACE_ID] = {BaseSpeed = 250, MaxSpeed = 290, SegmentDistance = 220, FallbackSpeed = 185},
-    [7449423635] = {BaseSpeed = 225, MaxSpeed = 260, SegmentDistance = 230, FallbackSpeed = 165},
+    [2753915549] = {BaseSpeed = 215, MaxSpeed = 245, SegmentDistance = 230, FallbackSpeed = 160},
+    [SEA_2_PLACE_ID] = {BaseSpeed = 240, MaxSpeed = 245, SegmentDistance = 220, FallbackSpeed = 185},
+    [7449423635] = {BaseSpeed = 225, MaxSpeed = 245, SegmentDistance = 230, FallbackSpeed = 165},
 }
 local SEA_PROFILE = SEA_PROFILES[game.PlaceId] or SEA_PROFILES[2753915549]
 local MAX_ADAPTIVE_TRAVEL_SPEED = SEA_PROFILE.MaxSpeed
 local MAX_MOVEMENT_SEGMENT_DISTANCE = SEA_PROFILE.SegmentDistance
 local RUBBERBAND_FALLBACK_SPEED = SEA_PROFILE.FallbackSpeed
 local STABLE_SEGMENTS_TO_RECOVER = 3
-local SPEED_RECOVERY_SEGMENTS = 6
+local SPEED_RECOVERY_SEGMENTS = 36
+local SPEED_BACKOFF_STEP = 5
+local SPEED_PROBE_STEP = 2
+local RUBBERBAND_STRIKES_REQUIRED = 1
+local RUBBERBAND_MIN_THRESHOLD = 8
 local SAFE_ROUTE_MIN_HORIZONTAL = 320
 local CHEST_STAGING_HEIGHT = 4.5
-local WATER_TRANSITION_SPEED_MULTIPLIER = 1.35
-local WATER_TRANSITION_MAX_SPEED = 330
+local WATER_TRANSITION_SPEED_MULTIPLIER = 1.04
+local WATER_TRANSITION_MAX_SPEED = 245
 local WATER_TRANSITION_DISTANCE = 96
 local WATER_ROUTE_SAMPLES = 9
 local WATER_HITS_REQUIRED = 2
@@ -59,6 +63,8 @@ local TEAM_SELECTION_TIMEOUT = 25
 local SCANNER_FULL_RESCAN_INTERVAL = 30
 local DEBUG_LOG_MAX_BYTES = 1024 * 1024
 local DEBUG_LOG_RETAIN_BYTES = 256 * 1024
+local SPEED_CALIBRATION_SCHEMA = 1
+local SPEED_CALIBRATION_FILE = "AutoChest_SpeedCalibration.json"
 local UPDATE_CACHE_FILE = "AutoChest_LastKnownGood.lua"
 local MAX_UPDATE_SOURCE_BYTES = 500 * 1024
 
@@ -268,6 +274,69 @@ local function normalizeSettings()
     end
 end
 
+-- A velocidade aprendida e telemetria interna, nao uma preferencia de UI.
+-- Cada mar recebe seu proprio teto para que uma conexao instavel no Sea 2 nao
+-- deixe os demais mares permanentemente lentos.
+local speedCalibration = {
+    __SchemaVersion = SPEED_CALIBRATION_SCHEMA,
+    Seas = {},
+}
+local speedCalibrationLoadMessage = "perfil novo"
+
+local function loadSpeedCalibration()
+    if not (Runtime.IsFile and Runtime.ReadFile and HttpService)
+        or not Runtime.IsFile(SPEED_CALIBRATION_FILE) then
+        return
+    end
+
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(Runtime.ReadFile(SPEED_CALIBRATION_FILE))
+    end)
+    if not ok or type(decoded) ~= "table" or type(decoded.Seas) ~= "table" then
+        speedCalibrationLoadMessage = "arquivo invalido; perfil novo"
+        return
+    end
+
+    speedCalibration = decoded
+    speedCalibration.__SchemaVersion = SPEED_CALIBRATION_SCHEMA
+    speedCalibrationLoadMessage = "perfil restaurado"
+end
+
+local function getSavedTravelCap()
+    local entry = speedCalibration.Seas[tostring(game.PlaceId)]
+    local savedSpeed = type(entry) == "table" and tonumber(entry.Speed) or nil
+    if not savedSpeed or savedSpeed ~= savedSpeed or math.abs(savedSpeed) == math.huge then
+        return SEA_PROFILE.BaseSpeed
+    end
+    return math.clamp(math.floor(savedSpeed + 0.5), RUBBERBAND_FALLBACK_SPEED,
+        MAX_ADAPTIVE_TRAVEL_SPEED)
+end
+
+local function saveSpeedCalibration(speed, reason)
+    if not (Runtime.WriteFile and HttpService) then return false end
+
+    local seaKey = tostring(game.PlaceId)
+    local entry = speedCalibration.Seas[seaKey]
+    if type(entry) ~= "table" then
+        entry = {}
+        speedCalibration.Seas[seaKey] = entry
+    end
+    entry.Speed = math.clamp(math.floor(tonumber(speed) or SEA_PROFILE.BaseSpeed),
+        RUBBERBAND_FALLBACK_SPEED, MAX_ADAPTIVE_TRAVEL_SPEED)
+    entry.UpdatedAt = os.time()
+    entry.Reason = tostring(reason or "runtime")
+    if reason == "rubberband" then
+        entry.Rubberbands = (tonumber(entry.Rubberbands) or 0) + 1
+    elseif reason == "stable-probe" then
+        entry.Probes = (tonumber(entry.Probes) or 0) + 1
+    end
+    speedCalibration.__SchemaVersion = SPEED_CALIBRATION_SCHEMA
+
+    return pcall(function()
+        Runtime.WriteFile(SPEED_CALIBRATION_FILE, HttpService:JSONEncode(speedCalibration))
+    end)
+end
+
 local LocalPlayer = Players.LocalPlayer
 while not LocalPlayer do
     task.wait(0.1)
@@ -289,6 +358,8 @@ if type(previousController) == "table" and type(previousController.SaveSettings)
 end
 loadSettings()
 normalizeSettings()
+loadSpeedCalibration()
+local INITIAL_TRAVEL_CAP = getSavedTravelCap()
 local Controller = {}
 Controller.SaveSettings = saveSettings
 Controller.Config = Config
@@ -321,6 +392,7 @@ local State = {
     LastMovementLogAt = 0,
     LastMovementLogPhase = nil,
     DebugLogBytes = nil,
+    DebugLogPersisted = false,
     LastGuardReason = nil,
     LastScanDiagnostics = nil,
     HopAttempts = 0,
@@ -372,7 +444,8 @@ local State = {
     RubberbandCorrections = 0,
     StableMovementSegments = 0,
     SpeedRecoverySegments = 0,
-    DynamicTravelCap = MAX_ADAPTIVE_TRAVEL_SPEED,
+    DynamicTravelCap = INITIAL_TRAVEL_CAP,
+    SpeedCalibrationPersisted = false,
     PendingServerId = nil,
     FailedServerUntil = {},
     TeleportStarted = false,
@@ -411,9 +484,9 @@ local function trackConnection(connection)
 end
 
 local function appendDebugLog(line)
-    if not (Config.DebugLog and Runtime.AppendFile) then return end
+    if not Config.DebugLog or not (Runtime.AppendFile or Runtime.WriteFile) then return end
     local payload = line .. "\n"
-    pcall(function()
+    local ok = pcall(function()
         if State.DebugLogBytes == nil then
             State.DebugLogBytes = 0
             if Runtime.IsFile and Runtime.ReadFile and Runtime.IsFile(Config.DebugLogFile) then
@@ -441,9 +514,28 @@ local function appendDebugLog(line)
             Runtime.WriteFile(Config.DebugLogFile, retained)
             State.DebugLogBytes = #retained
         end
-        Runtime.AppendFile(Config.DebugLogFile, payload)
-        State.DebugLogBytes = State.DebugLogBytes + #payload
+        if Runtime.AppendFile then
+            Runtime.AppendFile(Config.DebugLogFile, payload)
+            State.DebugLogBytes = State.DebugLogBytes + #payload
+            return
+        end
+
+        -- Alguns executores oferecem readfile/writefile, mas nao appendfile.
+        -- Neles o diagnostico continua invisivel e persistente sem perder o
+        -- historico existente.
+        local existing = ""
+        if Runtime.ReadFile and Runtime.IsFile and Runtime.IsFile(Config.DebugLogFile) then
+            existing = Runtime.ReadFile(Config.DebugLogFile)
+            if type(existing) ~= "string" then existing = "" end
+        end
+        local merged = existing .. payload
+        if #merged > DEBUG_LOG_MAX_BYTES then
+            merged = "[LOG ROTACIONADO]\n" .. merged:sub(-DEBUG_LOG_RETAIN_BYTES)
+        end
+        Runtime.WriteFile(Config.DebugLogFile, merged)
+        State.DebugLogBytes = #merged
     end)
+    State.DebugLogPersisted = ok
 end
 
 local function addLog(level, message)
@@ -1148,6 +1240,7 @@ local function unload()
     if State.Unloaded then return end
 
     State.SettingsPersisted = saveSettings()
+    State.SpeedCalibrationPersisted = saveSpeedCalibration(State.DynamicTravelCap, "unload")
     State.Unloaded = true
     Config.Enabled = false
     State.IsHopping = true
@@ -1572,6 +1665,22 @@ local function movementIsActive(char, root, humanoid, token)
         and root:IsDescendantOf(Workspace) and humanoid.Health > 0
 end
 
+local function setAdaptiveTravelCap(nextCap, reason)
+    local previous = State.DynamicTravelCap or SEA_PROFILE.BaseSpeed
+    local normalized = math.clamp(math.floor((tonumber(nextCap) or previous) + 0.5),
+        RUBBERBAND_FALLBACK_SPEED, MAX_ADAPTIVE_TRAVEL_SPEED)
+    if normalized == previous then return false end
+
+    State.DynamicTravelCap = normalized
+    State.SpeedCalibrationPersisted = saveSpeedCalibration(normalized, reason)
+    addLog("CALIB", string.format(
+        "Sea %s | teto %.0f -> %.0f/s | %s | salvo=%s",
+        tostring(game.PlaceId), previous, normalized, tostring(reason),
+        State.SpeedCalibrationPersisted and "sim" or "nao"
+    ))
+    return true
+end
+
 local function moveToPosition(targetCFrame, speed, context)
     local char = context and context.Character or getCharacter(1)
     local root = char and getRoot(char)
@@ -1585,7 +1694,11 @@ local function moveToPosition(targetCFrame, speed, context)
     local distance = (targetCFrame.Position - root.Position).Magnitude
     if distance <= 0.15 then return true end
     local requestedSpeed = speed or Config.TweenSpeed
-    local isTravelSegment = requestedSpeed >= Config.TweenSpeed
+    local isTravelSegment = (context and context.IsTravelSegment == true)
+        or requestedSpeed >= Config.TweenSpeed
+    local isCalibrationCandidate = isTravelSegment
+        and not (context and context.RubberbandRetryActive)
+        and requestedSpeed > RUBBERBAND_FALLBACK_SPEED + 1
     local effectiveSpeed = State.SafeSpeedMode
         and math.min(requestedSpeed, RUBBERBAND_FALLBACK_SPEED)
         or requestedSpeed
@@ -1598,6 +1711,7 @@ local function moveToPosition(targetCFrame, speed, context)
     local tween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = targetCFrame})
     State.CurrentTween = tween
     tween:Play()
+    local movementStartedAt = os.clock()
     local deadline = os.clock() + duration + 2
     local nextProgressAt = os.clock() + 1
     local bestRemaining = distance
@@ -1611,21 +1725,31 @@ local function moveToPosition(targetCFrame, speed, context)
                 context.ContactStarted = true
             end
             local currentRemaining = (root.Position - targetCFrame.Position).Magnitude
-            local correctionThreshold = math.max(18, effectiveSpeed * 0.12)
+            -- Compara tanto o melhor ponto alcancado quanto o progresso linear
+            -- esperado. Assim uma puxada curta, corrigida pelo tween no frame
+            -- seguinte, ainda e registrada como mini-TP.
+            local correctionThreshold = math.max(RUBBERBAND_MIN_THRESHOLD, effectiveSpeed * 0.035)
+            local expectedRemaining = math.max(0,
+                distance - effectiveSpeed * (os.clock() - movementStartedAt))
+            local scheduleLag = currentRemaining - expectedRemaining
             if currentRemaining < bestRemaining then
                 bestRemaining = currentRemaining
                 correctionStrikes = 0
-            elseif currentRemaining > bestRemaining + correctionThreshold then
+            end
+            if currentRemaining > bestRemaining + correctionThreshold
+                or scheduleLag > correctionThreshold then
                 correctionStrikes = correctionStrikes + 1
-                if correctionStrikes >= 3 then
+                if correctionStrikes >= RUBBERBAND_STRIKES_REQUIRED then
                     rubberbanded = true
                     State.SafeSpeedMode = true
                     State.RubberbandCorrections = State.RubberbandCorrections + 1
                     State.StableMovementSegments = 0
                     State.SpeedRecoverySegments = 0
-                    if isTravelSegment then
-                        State.DynamicTravelCap = math.max(RUBBERBAND_FALLBACK_SPEED,
-                            (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) - 15)
+                    if isCalibrationCandidate then
+                        setAdaptiveTravelCap(
+                            (State.DynamicTravelCap or SEA_PROFILE.BaseSpeed) - SPEED_BACKOFF_STEP,
+                            "rubberband"
+                        )
                     end
                     addLog("WARN", string.format(
                         "Correcao persistente do servidor (%.1f studs); repetindo trecho a %.0f/s",
@@ -1633,7 +1757,7 @@ local function moveToPosition(targetCFrame, speed, context)
                     ))
                     return false
                 end
-            else
+            elseif currentRemaining >= bestRemaining then
                 correctionStrikes = 0
             end
             if tween.PlaybackState == Enum.PlaybackState.Completed then
@@ -1644,9 +1768,11 @@ local function moveToPosition(targetCFrame, speed, context)
                     State.RubberbandCorrections = State.RubberbandCorrections + 1
                     State.StableMovementSegments = 0
                     State.SpeedRecoverySegments = 0
-                    if isTravelSegment then
-                        State.DynamicTravelCap = math.max(RUBBERBAND_FALLBACK_SPEED,
-                            (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) - 15)
+                    if isCalibrationCandidate then
+                        setAdaptiveTravelCap(
+                            (State.DynamicTravelCap or SEA_PROFILE.BaseSpeed) - SPEED_BACKOFF_STEP,
+                            "rubberband"
+                        )
                     end
                     addLog("WARN", string.format("Tween terminou fora do alvo: %.1f studs | Y=%.1f HP=%.1f",
                         remaining, root.Position.Y, humanoid.Health))
@@ -1664,8 +1790,11 @@ local function moveToPosition(targetCFrame, speed, context)
                     State.SpeedRecoverySegments = State.SpeedRecoverySegments + 1
                     if State.SpeedRecoverySegments >= SPEED_RECOVERY_SEGMENTS
                         and State.DynamicTravelCap < MAX_ADAPTIVE_TRAVEL_SPEED then
-                        State.DynamicTravelCap = math.min(MAX_ADAPTIVE_TRAVEL_SPEED,
-                            State.DynamicTravelCap + 5)
+                        setAdaptiveTravelCap(
+                            math.min(MAX_ADAPTIVE_TRAVEL_SPEED,
+                                State.DynamicTravelCap + SPEED_PROBE_STEP),
+                            "stable-probe"
+                        )
                         State.SpeedRecoverySegments = 0
                     end
                 end
@@ -1799,7 +1928,7 @@ local function buildChestRoute(origin, finalPosition)
     local transitionRatio = math.clamp(transitionDistance / horizontalDistance, 0.08, 0.24)
     local transitionSpeed = math.min(
         speed * WATER_TRANSITION_SPEED_MULTIPLIER,
-        (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) + 50,
+        (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) + 5,
         WATER_TRANSITION_MAX_SPEED
     )
     local takeoffBase = origin:Lerp(finalPosition, transitionRatio)
@@ -1842,15 +1971,19 @@ local function moveToChest(part, context)
             addLog("MOVE", string.format("%s %s | trecho %d/%d | %.1f studs @ %.0f/s", part.Name,
                 waypoint.Phase, index, #route, (waypoint.Position - root.Position).Magnitude, displayedSpeed))
         end
+        context.IsTravelSegment = true
         if not moveToPosition(CFrame.new(waypoint.Position) * root.CFrame.Rotation, waypoint.Speed, context) then
+            context.IsTravelSegment = false
             return false
         end
         if context.FinalApproachStarted and not part:IsDescendantOf(Workspace)
             and (root.Position - context.ContactPosition).Magnitude <= 12 then
             context.ContactStarted = true
+            context.IsTravelSegment = false
             return true
         end
     end
+    context.IsTravelSegment = false
     context.PrepareContact()
     return true
 end
@@ -1981,6 +2114,7 @@ local function collectChest(chestData)
         -- produzir apenas o efeito visual sem o servidor validar a coleta.
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
+        context.IsTravelSegment = false
         local contacted = moveToPosition(
             CFrame.new(part.Position + Vector3.new(0, 0.5, 0)),
             Config.ContactSpeed,
@@ -2372,18 +2506,21 @@ doServerHop = function(reason, isRetry)
 end
 
 -- ============================================================================
--- 9. INTERFACE VISUAL (ALL BLACK + RED)
+-- 9. INTERFACE VISUAL (FROSTED GRAPHITE + RED)
+-- Estrutura visual derivada do projeto local "Search for the needle": cabecalho
+-- limpo, badge, cards discretos e controles sem console/diagnostico visivel.
 -- ============================================================================
 local uiOk, uiError = pcall(function()
     local colors = {
-        Black = Color3.fromRGB(7, 7, 9),
-        Panel = Color3.fromRGB(13, 13, 16),
-        Raised = Color3.fromRGB(22, 22, 27),
-        Border = Color3.fromRGB(45, 45, 53),
-        Red = Color3.fromRGB(239, 45, 68),
-        RedDark = Color3.fromRGB(108, 24, 38),
-        White = Color3.fromRGB(242, 242, 244),
-        Muted = Color3.fromRGB(133, 133, 145),
+        Black = Color3.fromRGB(11, 14, 18),
+        Header = Color3.fromRGB(20, 25, 32),
+        Panel = Color3.fromRGB(25, 31, 39),
+        Raised = Color3.fromRGB(34, 41, 51),
+        Border = Color3.fromRGB(105, 117, 130),
+        Red = Color3.fromRGB(255, 57, 76),
+        RedDark = Color3.fromRGB(91, 25, 36),
+        White = Color3.fromRGB(238, 242, 246),
+        Muted = Color3.fromRGB(158, 169, 181),
     }
 
     local stalePending = CoreGui:FindFirstChild("AutoChestHUD_Pending")
@@ -2405,6 +2542,7 @@ local uiOk, uiError = pcall(function()
     card.Size = Config.Minimized and UDim2.fromOffset(420, 52) or UDim2.fromOffset(420, 268)
     card.Position = UDim2.new(0.025, 0, 0.22, 0)
     card.BackgroundColor3 = colors.Black
+    card.BackgroundTransparency = 0.08
     card.BorderSizePixel = 0
     card.Active = true
     card.ClipsDescendants = true
@@ -2415,31 +2553,62 @@ local uiOk, uiError = pcall(function()
     local cardStroke = Instance.new("UIStroke")
     cardStroke.Color = colors.Border
     cardStroke.Thickness = 1
+    cardStroke.Transparency = 0.42
     cardStroke.Parent = card
+    local cardGradient = Instance.new("UIGradient")
+    cardGradient.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, colors.Header),
+        ColorSequenceKeypoint.new(1, colors.Black),
+    })
+    cardGradient.Rotation = 90
+    cardGradient.Parent = card
 
     local titleBar = Instance.new("Frame")
     titleBar.Name = "TitleBar"
     titleBar.Size = UDim2.new(1, 0, 0, 52)
-    titleBar.BackgroundColor3 = colors.Panel
+    titleBar.BackgroundColor3 = colors.Header
+    titleBar.BackgroundTransparency = 0.08
     titleBar.BorderSizePixel = 0
     titleBar.Parent = card
     local titleCorner = Instance.new("UICorner")
     titleCorner.CornerRadius = UDim.new(0, 12)
     titleCorner.Parent = titleBar
 
-    local accent = Instance.new("Frame")
-    accent.Size = UDim2.fromOffset(4, 28)
-    accent.Position = UDim2.fromOffset(0, 12)
-    accent.BackgroundColor3 = colors.Red
-    accent.BorderSizePixel = 0
-    accent.Parent = titleBar
-    local accentCorner = Instance.new("UICorner")
-    accentCorner.CornerRadius = UDim.new(0, 3)
-    accentCorner.Parent = accent
+    local headerLine = Instance.new("Frame")
+    headerLine.Size = UDim2.new(1, 0, 0, 1)
+    headerLine.Position = UDim2.new(0, 0, 1, -1)
+    headerLine.BackgroundColor3 = colors.Border
+    headerLine.BackgroundTransparency = 0.64
+    headerLine.BorderSizePixel = 0
+    headerLine.Parent = titleBar
+
+    local logoIcon = Instance.new("Frame")
+    logoIcon.Name = "BrandBadge"
+    logoIcon.Size = UDim2.fromOffset(28, 28)
+    logoIcon.Position = UDim2.fromOffset(12, 12)
+    logoIcon.BackgroundColor3 = colors.RedDark
+    logoIcon.BackgroundTransparency = 0.12
+    logoIcon.BorderSizePixel = 0
+    logoIcon.Parent = titleBar
+    local logoCorner = Instance.new("UICorner")
+    logoCorner.CornerRadius = UDim.new(0, 7)
+    logoCorner.Parent = logoIcon
+    local logoStroke = Instance.new("UIStroke")
+    logoStroke.Color = colors.Red
+    logoStroke.Transparency = 0.45
+    logoStroke.Parent = logoIcon
+    local logoText = Instance.new("TextLabel")
+    logoText.Size = UDim2.fromScale(1, 1)
+    logoText.BackgroundTransparency = 1
+    logoText.Text = "A"
+    logoText.TextColor3 = colors.Red
+    logoText.Font = Enum.Font.GothamBold
+    logoText.TextSize = 15
+    logoText.Parent = logoIcon
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -110, 0, 22)
-    title.Position = UDim2.fromOffset(16, 6)
+    title.Size = UDim2.fromOffset(118, 20)
+    title.Position = UDim2.fromOffset(50, 7)
     title.BackgroundTransparency = 1
     title.Text = "AUTO CHEST"
     title.TextColor3 = colors.White
@@ -2449,14 +2618,14 @@ local uiOk, uiError = pcall(function()
     title.Parent = titleBar
 
     local subtitle = Instance.new("TextLabel")
-    subtitle.Size = UDim2.new(1, -110, 0, 14)
-    subtitle.Position = UDim2.fromOffset(16, 28)
+    subtitle.Size = UDim2.fromOffset(286, 14)
+    subtitle.Position = UDim2.fromOffset(50, 28)
     subtitle.BackgroundTransparency = 1
     local hasQueueApi = Runtime.QueueOnTeleport
     subtitle.Text = string.format("v%s  /  AUTO-EXEC %s  /  RECONNECT %s",
         SCRIPT_VERSION, hasQueueApi and "READY" or "N/A", Config.AutoReconnect and "ON" or "OFF")
     subtitle.TextColor3 = colors.Muted
-    subtitle.Font = Enum.Font.Gotham
+    subtitle.Font = Enum.Font.GothamMedium
     subtitle.TextSize = 9
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
     subtitle.Parent = titleBar
@@ -2464,10 +2633,10 @@ local uiOk, uiError = pcall(function()
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.fromOffset(28, 28)
     closeBtn.Position = UDim2.new(1, -38, 0, 12)
-    closeBtn.BackgroundColor3 = colors.RedDark
+    closeBtn.BackgroundColor3 = colors.Raised
     closeBtn.BorderSizePixel = 0
-    closeBtn.Text = "X"
-    closeBtn.TextColor3 = colors.White
+    closeBtn.Text = "×"
+    closeBtn.TextColor3 = colors.Red
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 13
     closeBtn.Parent = titleBar
@@ -2475,8 +2644,9 @@ local uiOk, uiError = pcall(function()
     closeCorner.CornerRadius = UDim.new(0, 7)
     closeCorner.Parent = closeBtn
     local closeStroke = Instance.new("UIStroke")
-    closeStroke.Color = colors.RedDark
+    closeStroke.Color = colors.Border
     closeStroke.Thickness = 1
+    closeStroke.Transparency = 0.55
     closeStroke.Parent = closeBtn
 
     local minimizeBtn = Instance.new("TextButton")
@@ -2495,6 +2665,7 @@ local uiOk, uiError = pcall(function()
     local minimizeStroke = Instance.new("UIStroke")
     minimizeStroke.Color = colors.Border
     minimizeStroke.Thickness = 1
+    minimizeStroke.Transparency = 0.55
     minimizeStroke.Parent = minimizeBtn
 
     -- Drag manual para substituir Frame.Draggable, que e obsoleto no Luau atual.
@@ -2546,6 +2717,7 @@ local uiOk, uiError = pcall(function()
         box.Size = UDim2.fromOffset(width, 48)
         box.Position = UDim2.fromOffset(x, 0)
         box.BackgroundColor3 = colors.Panel
+        box.BackgroundTransparency = 0.13
         box.BorderSizePixel = 0
         box.Parent = stats
         local corner = Instance.new("UICorner")
@@ -2554,6 +2726,7 @@ local uiOk, uiError = pcall(function()
         local stroke = Instance.new("UIStroke")
         stroke.Color = colors.Border
         stroke.Thickness = 1
+        stroke.Transparency = 0.76
         stroke.Parent = box
 
         local cap = Instance.new("TextLabel")
@@ -2588,6 +2761,7 @@ local uiOk, uiError = pcall(function()
     statusPanel.Size = UDim2.new(1, -32, 0, 42)
     statusPanel.Position = UDim2.fromOffset(16, 120)
     statusPanel.BackgroundColor3 = colors.Panel
+    statusPanel.BackgroundTransparency = 0.13
     statusPanel.BorderSizePixel = 0
     statusPanel.Parent = card
     local statusCorner = Instance.new("UICorner")
@@ -2596,6 +2770,7 @@ local uiOk, uiError = pcall(function()
     local statusStroke = Instance.new("UIStroke")
     statusStroke.Color = colors.Border
     statusStroke.Thickness = 1
+    statusStroke.Transparency = 0.76
     statusStroke.Parent = statusPanel
     local statusBar = Instance.new("Frame")
     statusBar.Size = UDim2.fromOffset(8, 8)
@@ -2637,6 +2812,7 @@ local uiOk, uiError = pcall(function()
         local stroke = Instance.new("UIStroke")
         stroke.Color = colors.RedDark
         stroke.Thickness = 1
+        stroke.Transparency = 0.38
         stroke.Parent = button
         return button
     end
@@ -2650,6 +2826,7 @@ local uiOk, uiError = pcall(function()
     targetBox.Size = UDim2.fromOffset(189, 32)
     targetBox.Position = UDim2.fromOffset(16, 218)
     targetBox.BackgroundColor3 = colors.Panel
+    targetBox.BackgroundTransparency = 0.13
     targetBox.BorderSizePixel = 0
     targetBox.PlaceholderText = "META DE BAUS"
     targetBox.PlaceholderColor3 = colors.Muted
@@ -2665,6 +2842,7 @@ local uiOk, uiError = pcall(function()
     local targetStroke = Instance.new("UIStroke")
     targetStroke.Color = colors.Border
     targetStroke.Thickness = 1
+    targetStroke.Transparency = 0.62
     targetStroke.Parent = targetBox
 
     local hopBtn = makeButton(215, 218, 189, "TROCAR SERVIDOR")
@@ -2850,6 +3028,12 @@ addLog("MOVE", string.format(
     "Perfil hibrido | voo=%.0f-%.0f/s contato=%.0f/s trecho<=%d | delay=%.2fs",
     Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.ContactSpeed,
     MAX_MOVEMENT_SEGMENT_DISTANCE, Config.CollectDelay))
+State.SpeedCalibrationPersisted = saveSpeedCalibration(State.DynamicTravelCap, "startup")
+addLog("CALIB", string.format(
+    "Sea %s | teto inicial=%.0f/s | %s | persistencia=%s",
+    tostring(game.PlaceId), State.DynamicTravelCap, speedCalibrationLoadMessage,
+    State.SpeedCalibrationPersisted and "OK" or "indisponivel"
+))
 addLog("ESP", "Sempre ativo | bronze=laranja prata=claro ouro=amarelo")
 addLog("TEAM", "Selecao automatica de Piratas ativa apos execute e server hop")
 addLog("UPDATE", string.format("Verificacao automatica a cada %ds", UPDATE_CHECK_INTERVAL))
