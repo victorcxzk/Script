@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.3)
+    AUTO CHEST & SERVER HOP (v2.7.4)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,24 +27,25 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.3"
-local SCRIPT_BUILD = "2026-10-06 / direct-flight-zero-chest-delay"
+local SCRIPT_VERSION = "2.7.4"
+local SCRIPT_BUILD = "2026-10-06 / hybrid-fast-safe-flight"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
 
-local SEA_1_PLACE_ID = 2753915549
-local SEA_2_PLACE_ID = 4442272183
-local SEA_3_PLACE_ID = 7449423635
-local CURRENT_PLACE_ID = game.PlaceId
-local IS_SEA_2 = CURRENT_PLACE_ID == SEA_2_PLACE_ID
-
--- A Sea 2 tem distancias maiores entre ilhas. Usa um perfil um pouco mais rapido,
--- mas ainda abaixo das velocidades que costumam provocar rubberband constante.
-local MAX_ADAPTIVE_TRAVEL_SPEED = IS_SEA_2 and 245 or 205
-local MAX_MOVEMENT_SEGMENT_DISTANCE = IS_SEA_2 and 180 or 140
-local RUBBERBAND_FALLBACK_SPEED = IS_SEA_2 and 165 or 140
-local STABLE_SEGMENTS_TO_RECOVER = IS_SEA_2 and 3 or 4
+local SEA_PROFILES = {
+    [2753915549] = {BaseSpeed = 180, MaxSpeed = 205, SegmentDistance = 220, FallbackSpeed = 140},
+    [4442272183] = {BaseSpeed = 205, MaxSpeed = 225, SegmentDistance = 260, FallbackSpeed = 150},
+    [7449423635] = {BaseSpeed = 185, MaxSpeed = 210, SegmentDistance = 230, FallbackSpeed = 140},
+}
+local SEA_PROFILE = SEA_PROFILES[game.PlaceId] or SEA_PROFILES[2753915549]
+local MAX_ADAPTIVE_TRAVEL_SPEED = SEA_PROFILE.MaxSpeed
+local MAX_MOVEMENT_SEGMENT_DISTANCE = SEA_PROFILE.SegmentDistance
+local RUBBERBAND_FALLBACK_SPEED = SEA_PROFILE.FallbackSpeed
+local STABLE_SEGMENTS_TO_RECOVER = 4
+local SPEED_RECOVERY_SEGMENTS = 12
+local SAFE_ROUTE_MIN_HORIZONTAL = 320
+local CHEST_STAGING_HEIGHT = 4.5
 local UPDATE_CHECK_INTERVAL = 60
 local AUTO_TEAM_NAME = "Pirates"
 local TEAM_SELECTION_TIMEOUT = 25
@@ -67,12 +68,9 @@ local Config = {
     ScannerWarmup = 8,              -- Impede hop antes do scanner estabilizar
     MinimumChestAnchors = 3,        -- Evita Hop enquanto o mapa ainda esta incompleto
 
-    TweenSpeed = IS_SEA_2 and 215 or 180, -- Sea 2 recebe cruzeiro maior; Sea 1/3 ficam conservadoras
-    VerticalSpeed = IS_SEA_2 and 95 or 80,   -- Subida/descida de viagem
+    TweenSpeed = SEA_PROFILE.BaseSpeed, -- Rapido, mas com limite dinamico por servidor
     MovementTimeout = 90,           -- Prazo por trecho; viagens longas sao divididas em trechos
-    FinalApproachDistance = 25,     -- Mantido por compatibilidade; voo normal agora e direto
-    FinalApproachSpeed = IS_SEA_2 and 150 or 125, -- Mantido para rotinas auxiliares
-    ContactSpeed = IS_SEA_2 and 48 or 42, -- Ultimo metro do contato; voo ate o bau continua rapido
+    ContactSpeed = game.PlaceId == 4442272183 and 34 or 30, -- Apenas os ultimos studs ficam controlados
     ArrivalTolerance = 5,           -- Distancia maxima para considerar que chegou ao bau
 
     Noclip = true,                  -- Atravessa paredes durante o deslocamento
@@ -80,7 +78,7 @@ local Config = {
     BypassWater = true,             -- Mantem o personagem suspenso para nao tomar dano de agua do mar
     SafeTravelHeight = 45,          -- Altura minima usada durante a travessia rapida
     CollectDelay = 0,               -- Sem espera artificial: confirmou -> procura o proximo imediatamente
-    TouchHold = 0.20,               -- Contato curto; suficiente para gerar Touched sem segurar o ciclo
+    TouchHold = 0.25,               -- Contato curto, mas cobre mais de um tick de rede
     CollectionTimeout = 3.0,        -- Prazo para o servidor confirmar a coleta
     RewardReplicationGrace = 1.5,   -- Tolera atraso da replicacao de Beli/Fragments
     CollectionRetries = 3,          -- Novas tentativas antes de desistir do bau
@@ -248,10 +246,7 @@ local function normalizeSettings()
     Config.ScannerWarmup = math.clamp(tonumber(Config.ScannerWarmup) or 8, 3, 30)
     Config.SafeTravelHeight = math.clamp(tonumber(Config.SafeTravelHeight) or 45, 20, 150)
     Config.TweenSpeed = math.clamp(Config.TweenSpeed, 20, MAX_ADAPTIVE_TRAVEL_SPEED)
-    Config.VerticalSpeed = math.clamp(Config.VerticalSpeed, 10, 100)
     Config.MovementTimeout = math.clamp(Config.MovementTimeout, 10, 180)
-    Config.FinalApproachDistance = math.clamp(Config.FinalApproachDistance, 8, 80)
-    Config.FinalApproachSpeed = math.clamp(Config.FinalApproachSpeed, 5, 180)
     Config.ContactSpeed = math.clamp(Config.ContactSpeed, 2, 60)
     Config.ArrivalTolerance = math.clamp(Config.ArrivalTolerance, 0.5, 8)
     Config.TouchHold = math.clamp(Config.TouchHold, 0.2, 2)
@@ -369,6 +364,8 @@ local State = {
     SafeSpeedMode = false,
     RubberbandCorrections = 0,
     StableMovementSegments = 0,
+    SpeedRecoverySegments = 0,
+    DynamicTravelCap = MAX_ADAPTIVE_TRAVEL_SPEED,
     PendingServerId = nil,
     FailedServerUntil = {},
     TeleportStarted = false,
@@ -1228,14 +1225,14 @@ local function isValidChest(inst)
 end
 
 local function getAdaptiveTravelSpeed(distance)
-    -- Boost conservador: o teto anterior de 320 causava correcoes do servidor.
-    -- O contato com o bau nao usa este boost.
+    -- O teto cai automaticamente quando o servidor corrige o personagem e
+    -- recupera aos poucos depois de varios checkpoints estaveis.
     local boostRatio = math.clamp((distance - 250) / 1750, 0, 1)
-    return math.min(Config.TweenSpeed + boostRatio * 20, MAX_ADAPTIVE_TRAVEL_SPEED)
+    return math.min(Config.TweenSpeed + boostRatio * 20,
+        State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED)
 end
 
 local function estimateChestTravelTime(origin, target)
-    -- O movimento real agora e uma linha reta do personagem ate o bau.
     local directDistance = (target - origin).Magnitude
     return directDistance / math.max(getAdaptiveTravelSpeed(directDistance), 1)
 end
@@ -1580,6 +1577,7 @@ local function moveToPosition(targetCFrame, speed, context)
     local distance = (targetCFrame.Position - root.Position).Magnitude
     if distance <= 0.15 then return true end
     local requestedSpeed = speed or Config.TweenSpeed
+    local isTravelSegment = requestedSpeed >= Config.TweenSpeed
     local effectiveSpeed = State.SafeSpeedMode
         and math.min(requestedSpeed, RUBBERBAND_FALLBACK_SPEED)
         or requestedSpeed
@@ -1616,6 +1614,11 @@ local function moveToPosition(targetCFrame, speed, context)
                     State.SafeSpeedMode = true
                     State.RubberbandCorrections = State.RubberbandCorrections + 1
                     State.StableMovementSegments = 0
+                    State.SpeedRecoverySegments = 0
+                    if isTravelSegment then
+                        State.DynamicTravelCap = math.max(RUBBERBAND_FALLBACK_SPEED,
+                            math.min(State.DynamicTravelCap, effectiveSpeed - 15))
+                    end
                     addLog("WARN", string.format(
                         "Correcao persistente do servidor (%.1f studs); repetindo trecho a %.0f/s",
                         currentRemaining - bestRemaining, RUBBERBAND_FALLBACK_SPEED
@@ -1632,16 +1635,30 @@ local function moveToPosition(targetCFrame, speed, context)
                     State.SafeSpeedMode = true
                     State.RubberbandCorrections = State.RubberbandCorrections + 1
                     State.StableMovementSegments = 0
+                    State.SpeedRecoverySegments = 0
+                    if isTravelSegment then
+                        State.DynamicTravelCap = math.max(RUBBERBAND_FALLBACK_SPEED,
+                            math.min(State.DynamicTravelCap, effectiveSpeed - 15))
+                    end
                     addLog("WARN", string.format("Tween terminou fora do alvo: %.1f studs | Y=%.1f HP=%.1f",
                         remaining, root.Position.Y, humanoid.Health))
                     return false
                 end
-                if State.SafeSpeedMode then
+                if State.SafeSpeedMode and isTravelSegment then
                     State.StableMovementSegments = State.StableMovementSegments + 1
                     if State.StableMovementSegments >= STABLE_SEGMENTS_TO_RECOVER then
                         State.SafeSpeedMode = false
                         State.StableMovementSegments = 0
-                        addLog("MOVE", "Movimento estabilizado; velocidade normal restaurada")
+                        addLog("MOVE", string.format(
+                            "Movimento estabilizado; teto adaptativo em %.0f/s", State.DynamicTravelCap))
+                    end
+                elseif isTravelSegment then
+                    State.SpeedRecoverySegments = State.SpeedRecoverySegments + 1
+                    if State.SpeedRecoverySegments >= SPEED_RECOVERY_SEGMENTS
+                        and State.DynamicTravelCap < MAX_ADAPTIVE_TRAVEL_SPEED then
+                        State.DynamicTravelCap = math.min(MAX_ADAPTIVE_TRAVEL_SPEED,
+                            State.DynamicTravelCap + 5)
+                        State.SpeedRecoverySegments = 0
                     end
                 end
                 return true
@@ -1671,39 +1688,65 @@ local function moveToPosition(targetCFrame, speed, context)
     return arrived
 end
 
--- Voo direto: nao cria subida, altura de cruzeiro nem descida artificial.
--- O VectorForce continua compensando a gravidade e o noclip permanece ativo.
+local function appendSegmentedRoute(segments, origin, target, speed, phase)
+    local distance = (target - origin).Magnitude
+    if distance <= 0.05 then return target end
+    local timeoutDistance = RUBBERBAND_FALLBACK_SPEED * Config.MovementTimeout * 0.70
+    local segmentLimit = math.max(20, math.min(MAX_MOVEMENT_SEGMENT_DISTANCE, timeoutDistance))
+    local count = math.max(1, math.ceil(distance / segmentLimit))
+    for segmentIndex = 1, count do
+        table.insert(segments, {
+            Position = origin:Lerp(target, segmentIndex / count),
+            Speed = speed,
+            Phase = phase,
+        })
+    end
+    return target
+end
+
+-- Rota hibrida: trajetos curtos continuam retos. Travessias longas em baixa
+-- altitude usam decolagem e pouso diagonais, evitando agua sem a antiga pausa
+-- de subir e descer verticalmente em cada bau.
 local function buildChestRoute(origin, finalPosition)
     local distance = (finalPosition - origin).Magnitude
     local speed = getAdaptiveTravelSpeed(distance)
-
-    -- Normalmente e um unico Tween reto. Apenas distancias extremas sao
-    -- divididas para manter cada Tween abaixo do MovementTimeout.
-    local safeDistancePerTween = math.max(1000, speed * Config.MovementTimeout * 0.80)
-    local count = math.max(1, math.ceil(distance / safeDistancePerTween))
     local segments = {}
 
-    for segmentIndex = 1, count do
-        table.insert(segments, {
-            Position = origin:Lerp(finalPosition, segmentIndex / count),
-            Speed = speed,
-            Phase = "voo direto",
-        })
+    local horizontalDistance = Vector3.new(
+        finalPosition.X - origin.X, 0, finalPosition.Z - origin.Z
+    ).Magnitude
+    local needsSafeCorridor = Config.BypassWater
+        and horizontalDistance >= SAFE_ROUTE_MIN_HORIZONTAL
+        and math.min(origin.Y, finalPosition.Y) < Config.SafeTravelHeight + 10
+
+    if not needsSafeCorridor then
+        appendSegmentedRoute(segments, origin, finalPosition, speed, "voo direto")
+        return segments
     end
 
+    local clearance = math.max(origin.Y, finalPosition.Y, Config.SafeTravelHeight) + 8
+    local transitionDistance = math.min(80, horizontalDistance * 0.20)
+    local transitionRatio = math.clamp(transitionDistance / horizontalDistance, 0.05, 0.25)
+    local takeoffBase = origin:Lerp(finalPosition, transitionRatio)
+    local landingBase = origin:Lerp(finalPosition, 1 - transitionRatio)
+    local takeoff = Vector3.new(takeoffBase.X, clearance, takeoffBase.Z)
+    local landing = Vector3.new(landingBase.X, clearance, landingBase.Z)
+
+    local previous = appendSegmentedRoute(segments, origin, takeoff, speed, "subida diagonal")
+    previous = appendSegmentedRoute(segments, previous, landing, speed, "travessia segura")
+    appendSegmentedRoute(segments, previous, finalPosition, speed, "descida diagonal")
     return segments
 end
 
 local function moveToChest(part, context)
     local root = getRoot(context.Character)
     if not root or not part or not part:IsDescendantOf(Workspace) then return false end
-    local finalPosition = part.Position + Vector3.new(0, 1.5, 0)
+    -- Para alguns studs acima do gatilho: a viagem continua rapida e a entrada
+    -- no hitbox acontece separadamente, depois de capturar o saldo correto.
+    local finalPosition = part.Position + Vector3.new(0, CHEST_STAGING_HEIGHT, 0)
     local route = buildChestRoute(root.Position, finalPosition)
     for index, waypoint in ipairs(route) do
         if not part:IsDescendantOf(Workspace) then return false end
-        if index == #route then
-            context.PrepareContact()
-        end
         local displayedSpeed = State.SafeSpeedMode
             and math.min(waypoint.Speed, RUBBERBAND_FALLBACK_SPEED)
             or waypoint.Speed
@@ -1721,6 +1764,7 @@ local function moveToChest(part, context)
             return false
         end
     end
+    context.PrepareContact()
     return true
 end
 
@@ -1915,45 +1959,84 @@ saveVisitedServer = function(jobId)
     end)
 end
 
-local function fetchHttpBody(url)
+local function callWithSoftTimeout(timeoutSeconds, callback)
+    local finished = false
+    local callOk = false
+    local result = nil
+    task.spawn(function()
+        local ok, value = pcall(callback)
+        if not finished then
+            callOk = ok
+            result = value
+            finished = true
+        end
+    end)
+    local deadline = os.clock() + timeoutSeconds
+    while not finished and not State.Unloaded and os.clock() < deadline do task.wait(0.05) end
+    if not finished then
+        finished = true
+        return false, string.format("timeout apos %.0fs", timeoutSeconds)
+    end
+    return callOk, result
+end
+
+local function decodeServerResponse(body, transport, errors)
+    if type(body) ~= "string" or #body == 0 then
+        table.insert(errors, transport .. ": resposta vazia")
+        return nil
+    end
+    local decoded, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if decoded and type(data) == "table" then return data, transport end
+    table.insert(errors, transport .. ": JSON invalido")
+    return nil
+end
+
+local function fetchHttpJson(url)
     local errors = {}
 
     -- Muitos executores permitem request/http_request mesmo quando game:HttpGet
     -- recebe bloqueio, rate-limit ou resposta vazia para games.roblox.com.
     if type(Runtime.Request) == "function" then
-        local ok, response = pcall(Runtime.Request, {
-            Url = url,
-            Method = "GET",
-            Headers = {
-                ["Accept"] = "application/json",
-                ["Cache-Control"] = "no-cache",
-            },
-        })
+        local ok, response = callWithSoftTimeout(5, function()
+            return Runtime.Request({
+                Url = url,
+                Method = "GET",
+                Headers = {
+                    ["Accept"] = "application/json",
+                    ["Cache-Control"] = "no-cache",
+                },
+            })
+        end)
         if ok and type(response) == "table" then
             local status = tonumber(response.StatusCode or response.Status or response.status_code) or 0
             local body = response.Body or response.body
             if type(body) == "string" and #body > 0 and (status == 0 or (status >= 200 and status < 300)) then
-                return body, "request"
+                local data, transport = decodeServerResponse(body, "request", errors)
+                if data then return data, transport end
+            else
+                table.insert(errors, "request HTTP " .. tostring(status))
             end
-            table.insert(errors, "request HTTP " .. tostring(status))
         elseif not ok then
             table.insert(errors, "request: " .. tostring(response))
         end
     end
 
-    local ok, body = pcall(function()
+    local ok, body = callWithSoftTimeout(5, function()
         return game:HttpGet(url, true)
     end)
     if ok and type(body) == "string" and #body > 0 then
-        return body, "HttpGet"
+        local data, transport = decodeServerResponse(body, "HttpGet", errors)
+        if data then return data, transport end
+    elseif not ok then
+        table.insert(errors, "HttpGet: " .. tostring(body))
     end
-    table.insert(errors, "HttpGet: " .. tostring(body))
 
     return nil, table.concat(errors, " | ")
 end
 
-local function fetchPublicServerCandidates(placeId, currentJob, ignoreVisited, sortOrder)
-    local candidates = {}
+local function fetchPublicServerCandidates(placeId, currentJob, sortOrder)
+    local unvisited = {}
+    local recycled = {}
     local cursor = nil
     local pagesRead = 0
     local serversSeen = 0
@@ -1961,7 +2044,7 @@ local function fetchPublicServerCandidates(placeId, currentJob, ignoreVisited, s
     local transportUsed = nil
     sortOrder = sortOrder == "Desc" and "Desc" or "Asc"
 
-    for _ = 1, 5 do
+    for _ = 1, 2 do
         -- Não usa excludeFullGames no query: alguns proxies/executores devolvem
         -- erro/resultado vazio com esse parâmetro. Servidores cheios já são
         -- filtrados localmente abaixo.
@@ -1972,20 +2055,12 @@ local function fetchPublicServerCandidates(placeId, currentJob, ignoreVisited, s
             cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
         )
 
-        local body, transportOrError = fetchHttpBody(url)
-        if not body then
+        local data, transportOrError = fetchHttpJson(url)
+        if not data then
             lastError = transportOrError
             break
         end
         transportUsed = transportOrError
-
-        local decodeOk, data = pcall(function()
-            return HttpService:JSONDecode(body)
-        end)
-        if not decodeOk or type(data) ~= "table" then
-            lastError = "JSON invalido via " .. tostring(transportUsed)
-            break
-        end
 
         pagesRead = pagesRead + 1
         local list = type(data.data) == "table" and data.data or {}
@@ -1993,25 +2068,26 @@ local function fetchPublicServerCandidates(placeId, currentJob, ignoreVisited, s
 
         for _, srv in ipairs(list) do
             local failedUntil = type(srv) == "table" and State.FailedServerUntil[srv.id] or nil
-            local notVisited = ignoreVisited or not visitedServers[srv.id]
             if type(srv) == "table" and type(srv.id) == "string" and srv.id ~= currentJob
                 and type(srv.playing) == "number" and type(srv.maxPlayers) == "number"
                 and srv.playing >= 0 and srv.playing < srv.maxPlayers
-                and notVisited and (not failedUntil or failedUntil <= os.clock()) then
-                table.insert(candidates, {Id = srv.id, Playing = srv.playing})
+                and (not failedUntil or failedUntil <= os.clock()) then
+                local candidate = {Id = srv.id, Playing = srv.playing}
+                table.insert(visitedServers[srv.id] and recycled or unvisited, candidate)
             end
         end
 
         cursor = data.nextPageCursor
-        if type(cursor) ~= "string" or cursor == "" then break end
+        if #unvisited + #recycled >= 20 or type(cursor) ~= "string" or cursor == "" then break end
     end
 
+    local candidates = #unvisited > 0 and unvisited or recycled
     table.sort(candidates, function(a, b)
         if a.Playing ~= b.Playing then return a.Playing < b.Playing end
         return a.Id < b.Id
     end)
 
-    return candidates, lastError, pagesRead, serversSeen, transportUsed
+    return candidates, #unvisited == 0 and #recycled > 0, lastError, pagesRead, serversSeen, transportUsed
 end
 
 doServerHop = function(reason, isRetry)
@@ -2114,19 +2190,13 @@ doServerHop = function(reason, isRetry)
     local placeId = game.PlaceId
     local currentJob = game.JobId
 
-    -- 1) Busca servidores menos cheios; 2) ignora histórico se necessário;
-    -- 3) tenta ordem inversa para contornar respostas/páginas inconsistentes.
-    local candidates, fetchError, pagesRead, serversSeen, transportUsed =
-        fetchPublicServerCandidates(placeId, currentJob, false, "Asc")
-
-    if #candidates == 0 then
-        candidates, fetchError, pagesRead, serversSeen, transportUsed =
-            fetchPublicServerCandidates(placeId, currentJob, true, "Asc")
-    end
-
-    if #candidates == 0 then
-        candidates, fetchError, pagesRead, serversSeen, transportUsed =
-            fetchPublicServerCandidates(placeId, currentJob, true, "Desc")
+    -- Alterna JobId publico com matchmaking nos retries. Isso mantem a busca
+    -- rapida por servidor vazio sem repetir erro 773 em todas as tentativas.
+    local useMatchmaking = isRetry and State.HopAttempts % 2 == 0
+    local candidates, recycledVisited, fetchError, pagesRead, serversSeen, transportUsed = {}, false, nil, 0, 0, nil
+    if not useMatchmaking then
+        candidates, recycledVisited, fetchError, pagesRead, serversSeen, transportUsed =
+            fetchPublicServerCandidates(placeId, currentJob, "Asc")
     end
 
     local chosen = candidates[1] and candidates[1].Id or nil
@@ -2135,21 +2205,25 @@ doServerHop = function(reason, isRetry)
     if chosen then
         State.PendingServerId = chosen
         addLog("HOP", string.format(
-            "Servidor encontrado via %s | paginas=%d vistos=%d | jogadores=%d",
+            "Servidor encontrado via %s | paginas=%d vistos=%d | jogadores=%d%s",
             tostring(transportUsed or "?"), tonumber(pagesRead) or 0,
-            tonumber(serversSeen) or 0, tonumber(candidates[1].Playing) or -1
+            tonumber(serversSeen) or 0, tonumber(candidates[1].Playing) or -1,
+            recycledVisited and " | reutilizando visitado" or ""
         ))
         teleportOk, teleportError = pcall(function()
             TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
         end)
     else
-        -- Último recurso: se o executor não consegue acessar a API pública,
-        -- ainda tenta pedir ao matchmaking do Roblox outro servidor em vez de
-        -- ficar parado em 15/15 para sempre.
-        addLog("WARN", string.format(
-            "Sem JobId pela API (paginas=%d vistos=%d erro=%s); usando fallback de matchmaking",
-            tonumber(pagesRead) or 0, tonumber(serversSeen) or 0, tostring(fetchError or "nenhum")
-        ))
+        -- Fallback e retries pares usam matchmaking para contornar 769/773 e
+        -- executores cuja API HTTP nao responde.
+        if useMatchmaking then
+            addLog("HOP", "Retry alternado pelo matchmaking do Roblox")
+        else
+            addLog("WARN", string.format(
+                "Sem JobId pela API (paginas=%d vistos=%d erro=%s); usando fallback de matchmaking",
+                tonumber(pagesRead) or 0, tonumber(serversSeen) or 0, tostring(fetchError or "nenhum")
+            ))
+        end
         State.PendingServerId = nil
         teleportOk, teleportError = pcall(function()
             TeleportService:Teleport(placeId, LocalPlayer)
@@ -2666,8 +2740,10 @@ addLog("BOOT", string.format("%s v%s | build %s | place=%s | job=%s",
     SCRIPT_NAME, SCRIPT_VERSION, SCRIPT_BUILD, tostring(game.PlaceId), tostring(game.JobId)))
 addLog("SOURCE", RAW_SCRIPT_URL)
 addLog("BOOT", "Scanner baseado no dump: Workspace.Map + Chest1/2/3 + TouchTransmitter")
-addLog("MOVE", string.format("Perfil direto | voo=%.0f-%.0f/s contato=%.0f/s | sem subida/descida | delay=%.2fs",
-    Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.ContactSpeed, Config.CollectDelay))
+addLog("MOVE", string.format(
+    "Perfil hibrido | voo=%.0f-%.0f/s contato=%.0f/s trecho<=%d | delay=%.2fs",
+    Config.TweenSpeed, getAdaptiveTravelSpeed(2000), Config.ContactSpeed,
+    MAX_MOVEMENT_SEGMENT_DISTANCE, Config.CollectDelay))
 addLog("ESP", "Sempre ativo | bronze=laranja prata=claro ouro=amarelo")
 addLog("TEAM", "Selecao automatica de Piratas ativa apos execute e server hop")
 addLog("UPDATE", string.format("Verificacao automatica a cada %ds", UPDATE_CHECK_INTERVAL))
