@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.6)
+    AUTO CHEST & SERVER HOP (v2.7.7)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,8 +27,8 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.6"
-local SCRIPT_BUILD = "2026-10-06 / water-aware-forward-climb"
+local SCRIPT_VERSION = "2.7.7"
+local SCRIPT_BUILD = "2026-10-06 / sticky-target-stealth-ui-bootstrap-update"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
@@ -52,6 +52,7 @@ local WATER_TRANSITION_MAX_SPEED = 330
 local WATER_TRANSITION_DISTANCE = 96
 local WATER_ROUTE_SAMPLES = 9
 local WATER_HITS_REQUIRED = 2
+local TARGET_MOVEMENT_RETRIES = 3
 local UPDATE_CHECK_INTERVAL = 60
 local AUTO_TEAM_NAME = "Pirates"
 local TEAM_SELECTION_TIMEOUT = 25
@@ -1821,6 +1822,13 @@ local function moveToChest(part, context)
     local route = buildChestRoute(root.Position, finalPosition)
     for index, waypoint in ipairs(route) do
         if not part:IsDescendantOf(Workspace) then return false end
+        if index == #route then
+            -- Captura o saldo somente na aproximacao final. Assim, se o gatilho
+            -- sumir pelo nosso contato antes do tween terminar, o alvo continua
+            -- confirmado em vez de o ciclo saltar para um bau distante.
+            context.PrepareContact()
+            context.FinalApproachStarted = true
+        end
         local displayedSpeed = State.SafeSpeedMode
             and math.min(waypoint.Speed, RUBBERBAND_FALLBACK_SPEED)
             or waypoint.Speed
@@ -1836,6 +1844,11 @@ local function moveToChest(part, context)
         end
         if not moveToPosition(CFrame.new(waypoint.Position) * root.CFrame.Rotation, waypoint.Speed, context) then
             return false
+        end
+        if context.FinalApproachStarted and not part:IsDescendantOf(Workspace)
+            and (root.Position - context.ContactPosition).Magnitude <= 12 then
+            context.ContactStarted = true
+            return true
         end
     end
     context.PrepareContact()
@@ -1930,7 +1943,20 @@ local function collectChest(chestData)
     end
     addLog("ALVO", string.format("%s | dist=%.1f | %s", chestData.Name, chestData.Distance, part:GetFullName()))
 
-    local arrived = moveToChest(part, context)
+    local arrived = false
+    for movementAttempt = 1, TARGET_MOVEMENT_RETRIES do
+        arrived = moveToChest(part, context)
+        if arrived then break end
+        if not movementIsActive(char, hrp, humanoid, context.Token)
+            or not part:IsDescendantOf(Workspace) then
+            break
+        end
+        addLog("MOVE", string.format("Mantendo alvo %s | retry de rota %d/%d",
+            chestData.Name, movementAttempt + 1, TARGET_MOVEMENT_RETRIES))
+        State.StatusMessage = string.format("Recalculando rota para %s (%d/%d)",
+            chestData.Name, movementAttempt + 1, TARGET_MOVEMENT_RETRIES)
+        task.wait(0.1)
+    end
     if not arrived then
         State.FailedUntil[part] = os.clock() + Config.FailedChestCooldown
         addLog("WARN", "Falha ao chegar em " .. chestData.Name)
@@ -2350,14 +2376,14 @@ end
 -- ============================================================================
 local uiOk, uiError = pcall(function()
     local colors = {
-        Black = Color3.fromRGB(5, 5, 6),
-        Panel = Color3.fromRGB(11, 11, 13),
-        Raised = Color3.fromRGB(18, 18, 21),
-        Border = Color3.fromRGB(42, 42, 48),
-        Red = Color3.fromRGB(225, 29, 72),
-        RedDark = Color3.fromRGB(115, 18, 38),
+        Black = Color3.fromRGB(7, 7, 9),
+        Panel = Color3.fromRGB(13, 13, 16),
+        Raised = Color3.fromRGB(22, 22, 27),
+        Border = Color3.fromRGB(45, 45, 53),
+        Red = Color3.fromRGB(239, 45, 68),
+        RedDark = Color3.fromRGB(108, 24, 38),
         White = Color3.fromRGB(242, 242, 244),
-        Muted = Color3.fromRGB(142, 142, 151),
+        Muted = Color3.fromRGB(133, 133, 145),
     }
 
     local stalePending = CoreGui:FindFirstChild("AutoChestHUD_Pending")
@@ -2376,7 +2402,7 @@ local uiOk, uiError = pcall(function()
 
     local card = Instance.new("Frame")
     card.Name = "Window"
-    card.Size = Config.Minimized and UDim2.fromOffset(440, 54) or UDim2.fromOffset(440, 376)
+    card.Size = Config.Minimized and UDim2.fromOffset(420, 52) or UDim2.fromOffset(420, 268)
     card.Position = UDim2.new(0.025, 0, 0.22, 0)
     card.BackgroundColor3 = colors.Black
     card.BorderSizePixel = 0
@@ -2384,57 +2410,69 @@ local uiOk, uiError = pcall(function()
     card.ClipsDescendants = true
     card.Parent = sg
     local cardCorner = Instance.new("UICorner")
-    cardCorner.CornerRadius = UDim.new(0, 5)
+    cardCorner.CornerRadius = UDim.new(0, 12)
     cardCorner.Parent = card
     local cardStroke = Instance.new("UIStroke")
-    cardStroke.Color = colors.RedDark
+    cardStroke.Color = colors.Border
     cardStroke.Thickness = 1
     cardStroke.Parent = card
 
+    local titleBar = Instance.new("Frame")
+    titleBar.Name = "TitleBar"
+    titleBar.Size = UDim2.new(1, 0, 0, 52)
+    titleBar.BackgroundColor3 = colors.Panel
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = card
+    local titleCorner = Instance.new("UICorner")
+    titleCorner.CornerRadius = UDim.new(0, 12)
+    titleCorner.Parent = titleBar
+
     local accent = Instance.new("Frame")
-    accent.Size = UDim2.new(1, 0, 0, 3)
+    accent.Size = UDim2.fromOffset(4, 28)
+    accent.Position = UDim2.fromOffset(0, 12)
     accent.BackgroundColor3 = colors.Red
     accent.BorderSizePixel = 0
-    accent.Parent = card
+    accent.Parent = titleBar
+    local accentCorner = Instance.new("UICorner")
+    accentCorner.CornerRadius = UDim.new(0, 3)
+    accentCorner.Parent = accent
 
     local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -110, 0, 25)
-    title.Position = UDim2.fromOffset(16, 11)
+    title.Size = UDim2.new(1, -110, 0, 22)
+    title.Position = UDim2.fromOffset(16, 6)
     title.BackgroundTransparency = 1
-    title.Text = string.format("CHEST CONTROL  v%s", SCRIPT_VERSION)
+    title.Text = "AUTO CHEST"
     title.TextColor3 = colors.White
     title.Font = Enum.Font.GothamBold
-    title.TextSize = 16
+    title.TextSize = 15
     title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = card
+    title.Parent = titleBar
 
     local subtitle = Instance.new("TextLabel")
     subtitle.Size = UDim2.new(1, -110, 0, 14)
-    subtitle.Position = UDim2.fromOffset(16, 34)
+    subtitle.Position = UDim2.fromOffset(16, 28)
     subtitle.BackgroundTransparency = 1
     local hasQueueApi = Runtime.QueueOnTeleport
-    subtitle.Text = string.format("AUTO-EXEC %s  /  RECONNECT %s  /  SETTINGS %s",
-        hasQueueApi and "READY" or "N/A",
-        Config.AutoReconnect and "ON" or "OFF",
-        Runtime.WriteFile and "READY" or "N/A")
+    subtitle.Text = string.format("v%s  /  AUTO-EXEC %s  /  RECONNECT %s",
+        SCRIPT_VERSION, hasQueueApi and "READY" or "N/A", Config.AutoReconnect and "ON" or "OFF")
     subtitle.TextColor3 = colors.Muted
     subtitle.Font = Enum.Font.Gotham
     subtitle.TextSize = 9
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
-    subtitle.Parent = card
+    subtitle.Parent = titleBar
 
     local closeBtn = Instance.new("TextButton")
-    closeBtn.Size = UDim2.fromOffset(30, 30)
-    closeBtn.Position = UDim2.new(1, -42, 0, 11)
-    closeBtn.BackgroundColor3 = colors.Raised
+    closeBtn.Size = UDim2.fromOffset(28, 28)
+    closeBtn.Position = UDim2.new(1, -38, 0, 12)
+    closeBtn.BackgroundColor3 = colors.RedDark
     closeBtn.BorderSizePixel = 0
     closeBtn.Text = "X"
-    closeBtn.TextColor3 = colors.Red
+    closeBtn.TextColor3 = colors.White
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 13
-    closeBtn.Parent = card
+    closeBtn.Parent = titleBar
     local closeCorner = Instance.new("UICorner")
-    closeCorner.CornerRadius = UDim.new(0, 4)
+    closeCorner.CornerRadius = UDim.new(0, 7)
     closeCorner.Parent = closeBtn
     local closeStroke = Instance.new("UIStroke")
     closeStroke.Color = colors.RedDark
@@ -2442,17 +2480,17 @@ local uiOk, uiError = pcall(function()
     closeStroke.Parent = closeBtn
 
     local minimizeBtn = Instance.new("TextButton")
-    minimizeBtn.Size = UDim2.fromOffset(30, 30)
-    minimizeBtn.Position = UDim2.new(1, -78, 0, 11)
+    minimizeBtn.Size = UDim2.fromOffset(28, 28)
+    minimizeBtn.Position = UDim2.new(1, -72, 0, 12)
     minimizeBtn.BackgroundColor3 = colors.Raised
     minimizeBtn.BorderSizePixel = 0
     minimizeBtn.Text = Config.Minimized and "+" or "-"
     minimizeBtn.TextColor3 = colors.White
     minimizeBtn.Font = Enum.Font.GothamBold
     minimizeBtn.TextSize = 15
-    minimizeBtn.Parent = card
+    minimizeBtn.Parent = titleBar
     local minimizeCorner = Instance.new("UICorner")
-    minimizeCorner.CornerRadius = UDim.new(0, 4)
+    minimizeCorner.CornerRadius = UDim.new(0, 7)
     minimizeCorner.Parent = minimizeBtn
     local minimizeStroke = Instance.new("UIStroke")
     minimizeStroke.Color = colors.Border
@@ -2464,7 +2502,7 @@ local uiOk, uiError = pcall(function()
     local dragInput = nil
     local dragStart = nil
     local startPosition = nil
-    trackConnection(card.InputBegan:Connect(function(input)
+    trackConnection(titleBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
@@ -2477,7 +2515,7 @@ local uiOk, uiError = pcall(function()
             end))
         end
     end))
-    trackConnection(card.InputChanged:Connect(function(input)
+    trackConnection(titleBar.InputChanged:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseMovement
             or input.UserInputType == Enum.UserInputType.Touch then
             dragInput = input
@@ -2499,7 +2537,7 @@ local uiOk, uiError = pcall(function()
 
     local stats = Instance.new("Frame")
     stats.Size = UDim2.new(1, -32, 0, 48)
-    stats.Position = UDim2.fromOffset(16, 58)
+    stats.Position = UDim2.fromOffset(16, 62)
     stats.BackgroundTransparency = 1
     stats.Parent = card
 
@@ -2510,6 +2548,9 @@ local uiOk, uiError = pcall(function()
         box.BackgroundColor3 = colors.Panel
         box.BorderSizePixel = 0
         box.Parent = stats
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = box
         local stroke = Instance.new("UIStroke")
         stroke.Color = colors.Border
         stroke.Thickness = 1
@@ -2539,29 +2580,36 @@ local uiOk, uiError = pcall(function()
         return value
     end
 
-    local collectedValue = makeStat(0, 128, "COLETADOS")
-    local targetValue = makeStat(138, 128, "META")
-    local scanValue = makeStat(276, 132, "SCANNER")
+    local collectedValue = makeStat(0, 122, "SERVIDOR / SESSAO")
+    local targetValue = makeStat(133, 122, "META")
+    local scanValue = makeStat(266, 122, "BAUS ATIVOS")
 
     local statusPanel = Instance.new("Frame")
     statusPanel.Size = UDim2.new(1, -32, 0, 42)
-    statusPanel.Position = UDim2.fromOffset(16, 116)
+    statusPanel.Position = UDim2.fromOffset(16, 120)
     statusPanel.BackgroundColor3 = colors.Panel
     statusPanel.BorderSizePixel = 0
     statusPanel.Parent = card
+    local statusCorner = Instance.new("UICorner")
+    statusCorner.CornerRadius = UDim.new(0, 8)
+    statusCorner.Parent = statusPanel
     local statusStroke = Instance.new("UIStroke")
     statusStroke.Color = colors.Border
     statusStroke.Thickness = 1
     statusStroke.Parent = statusPanel
     local statusBar = Instance.new("Frame")
-    statusBar.Size = UDim2.fromOffset(3, 42)
+    statusBar.Size = UDim2.fromOffset(8, 8)
+    statusBar.Position = UDim2.fromOffset(12, 17)
     statusBar.BackgroundColor3 = colors.Red
     statusBar.BorderSizePixel = 0
     statusBar.Parent = statusPanel
+    local statusDotCorner = Instance.new("UICorner")
+    statusDotCorner.CornerRadius = UDim.new(1, 0)
+    statusDotCorner.Parent = statusBar
 
     local statusLbl = Instance.new("TextLabel")
-    statusLbl.Size = UDim2.new(1, -20, 1, 0)
-    statusLbl.Position = UDim2.fromOffset(12, 0)
+    statusLbl.Size = UDim2.new(1, -42, 1, 0)
+    statusLbl.Position = UDim2.fromOffset(30, 0)
     statusLbl.BackgroundTransparency = 1
     statusLbl.Text = "INICIALIZANDO"
     statusLbl.TextColor3 = colors.White
@@ -2581,7 +2629,11 @@ local uiOk, uiError = pcall(function()
         button.TextColor3 = colors.White
         button.Font = Enum.Font.GothamBold
         button.TextSize = 10
+        button.AutoButtonColor = false
         button.Parent = card
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = button
         local stroke = Instance.new("UIStroke")
         stroke.Color = colors.RedDark
         stroke.Thickness = 1
@@ -2589,14 +2641,14 @@ local uiOk, uiError = pcall(function()
         return button
     end
 
-    local toggleBtn = makeButton(16, 170, 198, Config.Enabled and "AUTO-CHEST  /  ON" or "AUTO-CHEST  /  OFF")
-    local targetHopBtn = makeButton(226, 170, 198, Config.HopAfterTarget and "HOP NA META  /  ON" or "HOP NA META  /  OFF")
+    local toggleBtn = makeButton(16, 174, 189, Config.Enabled and "AUTO CHEST   ON" or "AUTO CHEST   OFF")
+    local targetHopBtn = makeButton(215, 174, 189, Config.HopAfterTarget and "HOP NA META   ON" or "HOP NA META   OFF")
     toggleBtn.BackgroundColor3 = Config.Enabled and colors.RedDark or colors.Raised
     targetHopBtn.BackgroundColor3 = Config.HopAfterTarget and colors.RedDark or colors.Raised
 
     local targetBox = Instance.new("TextBox")
-    targetBox.Size = UDim2.fromOffset(198, 32)
-    targetBox.Position = UDim2.fromOffset(16, 212)
+    targetBox.Size = UDim2.fromOffset(189, 32)
+    targetBox.Position = UDim2.fromOffset(16, 218)
     targetBox.BackgroundColor3 = colors.Panel
     targetBox.BorderSizePixel = 0
     targetBox.PlaceholderText = "META DE BAUS"
@@ -2607,58 +2659,25 @@ local uiOk, uiError = pcall(function()
     targetBox.TextSize = 11
     targetBox.ClearTextOnFocus = true
     targetBox.Parent = card
+    local targetCorner = Instance.new("UICorner")
+    targetCorner.CornerRadius = UDim.new(0, 8)
+    targetCorner.Parent = targetBox
     local targetStroke = Instance.new("UIStroke")
     targetStroke.Color = colors.Border
     targetStroke.Thickness = 1
     targetStroke.Parent = targetBox
 
-    local hopBtn = makeButton(226, 212, 198, "FORCAR SERVER HOP")
-    local teamRetryBtn = makeButton(226, 212, 198, "TENTAR PIRATAS")
+    local hopBtn = makeButton(215, 218, 189, "TROCAR SERVIDOR")
+    local teamRetryBtn = makeButton(215, 218, 189, "TENTAR PIRATAS")
     teamRetryBtn.BackgroundColor3 = colors.RedDark
     teamRetryBtn.Visible = false
-
-    local logPanel = Instance.new("Frame")
-    logPanel.Size = UDim2.new(1, -32, 0, 108)
-    logPanel.Position = UDim2.fromOffset(16, 256)
-    logPanel.BackgroundColor3 = colors.Panel
-    logPanel.BorderSizePixel = 0
-    logPanel.Parent = card
-    local logStroke = Instance.new("UIStroke")
-    logStroke.Color = colors.Border
-    logStroke.Thickness = 1
-    logStroke.Parent = logPanel
-
-    local logTitle = Instance.new("TextLabel")
-    logTitle.Size = UDim2.new(1, -16, 0, 18)
-    logTitle.Position = UDim2.fromOffset(8, 4)
-    logTitle.BackgroundTransparency = 1
-    logTitle.Text = "LIVE DIAGNOSTICS"
-    logTitle.TextColor3 = colors.Red
-    logTitle.Font = Enum.Font.Code
-    logTitle.TextSize = 10
-    logTitle.TextXAlignment = Enum.TextXAlignment.Left
-    logTitle.Parent = logPanel
-
-    local logLbl = Instance.new("TextLabel")
-    logLbl.Size = UDim2.new(1, -16, 1, -26)
-    logLbl.Position = UDim2.fromOffset(8, 22)
-    logLbl.BackgroundTransparency = 1
-    logLbl.Text = "Aguardando o primeiro scan..."
-    logLbl.TextColor3 = colors.Muted
-    logLbl.Font = Enum.Font.Code
-    logLbl.TextSize = 9
-    logLbl.TextXAlignment = Enum.TextXAlignment.Left
-    logLbl.TextYAlignment = Enum.TextYAlignment.Top
-    logLbl.TextWrapped = false
-    logLbl.TextTruncate = Enum.TextTruncate.AtEnd
-    logLbl.Parent = logPanel
 
     -- Modal de atualizacao: cobre os controles para que a nova versao nunca
     -- passe despercebida, mesmo se o menu estava minimizado.
     local updatePanel = Instance.new("Frame")
     updatePanel.Name = "UpdateAvailable"
-    updatePanel.Size = UDim2.fromOffset(408, 248)
-    updatePanel.Position = UDim2.fromOffset(16, 116)
+    updatePanel.Size = UDim2.fromOffset(388, 198)
+    updatePanel.Position = UDim2.fromOffset(16, 58)
     updatePanel.BackgroundColor3 = colors.Black
     updatePanel.BorderSizePixel = 0
     updatePanel.Visible = false
@@ -2685,8 +2704,8 @@ local uiOk, uiError = pcall(function()
     updateTitle.Parent = updatePanel
 
     local updateInfo = Instance.new("TextLabel")
-    updateInfo.Size = UDim2.new(1, -24, 0, 100)
-    updateInfo.Position = UDim2.fromOffset(12, 50)
+    updateInfo.Size = UDim2.new(1, -24, 0, 78)
+    updateInfo.Position = UDim2.fromOffset(12, 48)
     updateInfo.BackgroundTransparency = 1
     updateInfo.Text = "Uma nova versao do Auto Chest esta pronta. A coleta sera retomada automaticamente depois da atualizacao."
     updateInfo.TextColor3 = colors.White
@@ -2699,8 +2718,8 @@ local uiOk, uiError = pcall(function()
     updateInfo.Parent = updatePanel
 
     local updateBtn = Instance.new("TextButton")
-    updateBtn.Size = UDim2.new(1, -24, 0, 48)
-    updateBtn.Position = UDim2.fromOffset(12, 184)
+    updateBtn.Size = UDim2.new(1, -24, 0, 42)
+    updateBtn.Position = UDim2.fromOffset(12, 142)
     updateBtn.BackgroundColor3 = colors.RedDark
     updateBtn.BorderSizePixel = 0
     updateBtn.Text = "ATUALIZAR AGORA"
@@ -2719,7 +2738,7 @@ local uiOk, uiError = pcall(function()
 
     hud.ShowUpdate = function(version)
         Config.Minimized = false
-        card.Size = UDim2.fromOffset(440, 376)
+        card.Size = UDim2.fromOffset(420, 268)
         minimizeBtn.Text = "-"
         updateTitle.Text = string.format("ATUALIZACAO v%s DISPONIVEL", tostring(version))
         updateInfo.Text = string.format(
@@ -2741,7 +2760,7 @@ local uiOk, uiError = pcall(function()
 
     trackConnection(toggleBtn.MouseButton1Click:Connect(function()
         Config.Enabled = not Config.Enabled
-        toggleBtn.Text = Config.Enabled and "AUTO-CHEST  /  ON" or "AUTO-CHEST  /  OFF"
+        toggleBtn.Text = Config.Enabled and "AUTO CHEST   ON" or "AUTO CHEST   OFF"
         toggleBtn.BackgroundColor3 = Config.Enabled and colors.RedDark or colors.Raised
         if Config.Enabled then
             State.EmptySince = nil
@@ -2759,7 +2778,7 @@ local uiOk, uiError = pcall(function()
 
     trackConnection(targetHopBtn.MouseButton1Click:Connect(function()
         Config.HopAfterTarget = not Config.HopAfterTarget
-        targetHopBtn.Text = Config.HopAfterTarget and "HOP NA META  /  ON" or "HOP NA META  /  OFF"
+        targetHopBtn.Text = Config.HopAfterTarget and "HOP NA META   ON" or "HOP NA META   OFF"
         targetHopBtn.BackgroundColor3 = Config.HopAfterTarget and colors.RedDark or colors.Raised
         addLog("INFO", "Hop na meta: " .. (Config.HopAfterTarget and "ON" or "OFF"))
         State.SettingsPersisted = saveSettings()
@@ -2789,13 +2808,13 @@ local uiOk, uiError = pcall(function()
         if State.UpdateAvailable then
             Config.Minimized = false
             minimizeBtn.Text = "-"
-            card.Size = UDim2.fromOffset(440, 376)
+            card.Size = UDim2.fromOffset(420, 268)
             addLog("UPDATE", "Atualizacao pendente; aviso mantido aberto")
             return
         end
         Config.Minimized = not Config.Minimized
         minimizeBtn.Text = Config.Minimized and "+" or "-"
-        card.Size = Config.Minimized and UDim2.fromOffset(440, 54) or UDim2.fromOffset(440, 376)
+        card.Size = Config.Minimized and UDim2.fromOffset(420, 52) or UDim2.fromOffset(420, 268)
         State.SettingsPersisted = saveSettings()
     end))
     trackConnection(closeBtn.MouseButton1Click:Connect(unload))
@@ -2806,7 +2825,9 @@ local uiOk, uiError = pcall(function()
     hud.targetValue = targetValue
     hud.scanValue = scanValue
     hud.statusLbl = statusLbl
-    hud.logLbl = logLbl
+    hud.statusDot = statusBar
+    hud.activeColor = colors.Red
+    hud.inactiveColor = colors.Muted
     hud.updatePanel = updatePanel
     hud.hopBtn = hopBtn
     hud.teamRetryBtn = teamRetryBtn
@@ -2843,8 +2864,13 @@ task.spawn(function()
 end)
 task.spawn(function()
     if not waitForControllerActivation() then return end
-    task.wait(2)
-    checkForUpdates("startup")
+    task.wait(0.25)
+    if checkForUpdates("startup") then
+        -- Reexecutar o arquivo local agora faz handoff automatico para o codigo
+        -- remoto mais novo. Atualizacoes detectadas durante a sessao continuam
+        -- usando o aviso explicito com botao.
+        applyAvailableUpdate()
+    end
     while not State.Unloaded do
         task.wait(UPDATE_CHECK_INTERVAL)
         if not State.Unloaded then checkForUpdates("periodic") end
@@ -2860,10 +2886,9 @@ task.spawn(function()
                 or (State.AutoExecuteQueued and "QUEUED")
                 or (queueApiAvailable and "READY")
                 or "N/A"
-            hud.subtitle.Text = string.format("AUTO-EXEC %s  /  RECONNECT %s  /  SETTINGS %s",
-                autoExecuteState,
-                Config.AutoReconnect and "ON" or "OFF",
-                State.SettingsPersisted and "SAVED" or "ERROR")
+            hud.subtitle.Text = string.format("v%s  /  AUTO-EXEC %s  /  RECONNECT %s  /  %s",
+                SCRIPT_VERSION, autoExecuteState, Config.AutoReconnect and "ON" or "OFF",
+                State.SettingsPersisted and "SALVO" or "ERRO")
         end
         if hud.collectedValue then
             hud.collectedValue.Text = string.format("%d  /  %d", State.CollectedInServer, State.TotalCollectedSession)
@@ -2878,8 +2903,8 @@ task.spawn(function()
         if hud.statusLbl then
             hud.statusLbl.Text = string.upper(State.StatusMessage)
         end
-        if hud.logLbl then
-            hud.logLbl.Text = #State.LogEntries > 0 and table.concat(State.LogEntries, "\n") or "Aguardando o primeiro scan..."
+        if hud.statusDot then
+            hud.statusDot.BackgroundColor3 = Config.Enabled and hud.activeColor or hud.inactiveColor
         end
         if hud.teamRetryBtn and hud.hopBtn then
             hud.teamRetryBtn.Visible = State.TeamSelectionBlocked
@@ -3048,7 +3073,7 @@ task.spawn(function()
             if not cycleOk then
                 cancelCurrentMovement()
                 local message = tostring(cycleError)
-                State.StatusMessage = "Erro recuperavel no ciclo; veja o LOG"
+                State.StatusMessage = "Erro recuperavel; diagnostico salvo internamente"
                 if State.LastRuntimeError ~= message then
                     State.LastRuntimeError = message
                     addLog("ERRO", message)
