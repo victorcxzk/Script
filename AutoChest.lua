@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.5)
+    AUTO CHEST & SERVER HOP (v2.7.6)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,29 +27,31 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.5"
-local SCRIPT_BUILD = "2026-10-06 / faster-water-sea2-safe-hop"
+local SCRIPT_VERSION = "2.7.6"
+local SCRIPT_BUILD = "2026-10-06 / water-aware-forward-climb"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
 
 local SEA_2_PLACE_ID = 4442272183
 local SEA_PROFILES = {
-    [2753915549] = {BaseSpeed = 200, MaxSpeed = 230, SegmentDistance = 250, FallbackSpeed = 150},
-    [SEA_2_PLACE_ID] = {BaseSpeed = 235, MaxSpeed = 270, SegmentDistance = 290, FallbackSpeed = 175},
-    [7449423635] = {BaseSpeed = 210, MaxSpeed = 245, SegmentDistance = 260, FallbackSpeed = 155},
+    [2753915549] = {BaseSpeed = 215, MaxSpeed = 250, SegmentDistance = 230, FallbackSpeed = 160},
+    [SEA_2_PLACE_ID] = {BaseSpeed = 250, MaxSpeed = 290, SegmentDistance = 220, FallbackSpeed = 185},
+    [7449423635] = {BaseSpeed = 225, MaxSpeed = 260, SegmentDistance = 230, FallbackSpeed = 165},
 }
 local SEA_PROFILE = SEA_PROFILES[game.PlaceId] or SEA_PROFILES[2753915549]
 local MAX_ADAPTIVE_TRAVEL_SPEED = SEA_PROFILE.MaxSpeed
 local MAX_MOVEMENT_SEGMENT_DISTANCE = SEA_PROFILE.SegmentDistance
 local RUBBERBAND_FALLBACK_SPEED = SEA_PROFILE.FallbackSpeed
-local STABLE_SEGMENTS_TO_RECOVER = 4
-local SPEED_RECOVERY_SEGMENTS = 12
+local STABLE_SEGMENTS_TO_RECOVER = 3
+local SPEED_RECOVERY_SEGMENTS = 6
 local SAFE_ROUTE_MIN_HORIZONTAL = 320
 local CHEST_STAGING_HEIGHT = 4.5
-local WATER_TRANSITION_SPEED_MULTIPLIER = 1.28
-local WATER_TRANSITION_MAX_SPEED = 300
-local WATER_TRANSITION_DISTANCE = 46
+local WATER_TRANSITION_SPEED_MULTIPLIER = 1.35
+local WATER_TRANSITION_MAX_SPEED = 330
+local WATER_TRANSITION_DISTANCE = 96
+local WATER_ROUTE_SAMPLES = 9
+local WATER_HITS_REQUIRED = 2
 local UPDATE_CHECK_INTERVAL = 60
 local AUTO_TEAM_NAME = "Pirates"
 local TEAM_SELECTION_TIMEOUT = 25
@@ -1709,6 +1711,65 @@ local function appendSegmentedRoute(segments, origin, target, speed, phase)
     return target
 end
 
+local function isWaterLikeHit(result)
+    if not result then return false end
+    if result.Material == Enum.Material.Water then return true end
+
+    local instance = result.Instance
+    if not instance then return false end
+    local name = tostring(instance.Name or ""):lower()
+    if name:find("water", 1, true) or name:find("ocean", 1, true)
+        or name == "sea" or name:find("sea_", 1, true) then
+        return true
+    end
+
+    local tagged = false
+    pcall(function()
+        tagged = CollectionService:HasTag(instance, "WaterVolume")
+            or CollectionService:HasTag(instance, "WaterBody")
+            or instance:GetAttribute("WaterBodyName") ~= nil
+            or instance:GetAttribute("WaterPriority") ~= nil
+    end)
+    return tagged
+end
+
+local function routeCrossesExposedWater(origin, finalPosition)
+    -- O dump fornece WaterVolume/WaterBody e o material Water. Raycasts de cima
+    -- encontram primeiro a terra ou a agua realmente exposta, evitando subir
+    -- apenas porque o bau esta longe.
+    if not Workspace or type(Workspace.Raycast) ~= "function" or not RaycastParams then
+        return true -- fallback conservador para executores sem a API moderna
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local character = LocalPlayer and LocalPlayer.Character
+    params.FilterDescendantsInstances = character and {character} or {}
+    params.IgnoreWater = false
+    pcall(function() params.RespectCanCollide = false end)
+
+    local probeTop = math.max(origin.Y, finalPosition.Y, Config.SafeTravelHeight) + 128
+    local probeDirection = Vector3.new(0, -math.max(4096, probeTop + 2048), 0)
+    local consecutiveWaterHits = 0
+
+    for sampleIndex = 1, WATER_ROUTE_SAMPLES do
+        local ratio = sampleIndex / (WATER_ROUTE_SAMPLES + 1)
+        local point = origin:Lerp(finalPosition, ratio)
+        local ok, result = pcall(function()
+            return Workspace:Raycast(Vector3.new(point.X, probeTop, point.Z), probeDirection, params)
+        end)
+        if not ok then return true end
+
+        if isWaterLikeHit(result) then
+            consecutiveWaterHits = consecutiveWaterHits + 1
+            if consecutiveWaterHits >= WATER_HITS_REQUIRED then return true end
+        else
+            consecutiveWaterHits = 0
+        end
+    end
+    return false
+end
+
 -- Rota hibrida: trajetos curtos continuam retos. Travessias longas em baixa
 -- altitude usam decolagem e pouso diagonais, evitando agua sem a antiga pausa
 -- de subir e descer verticalmente em cada bau.
@@ -1723,6 +1784,7 @@ local function buildChestRoute(origin, finalPosition)
     local needsSafeCorridor = Config.BypassWater
         and horizontalDistance >= SAFE_ROUTE_MIN_HORIZONTAL
         and math.min(origin.Y, finalPosition.Y) < Config.SafeTravelHeight + 10
+        and routeCrossesExposedWater(origin, finalPosition)
 
     if not needsSafeCorridor then
         appendSegmentedRoute(segments, origin, finalPosition, speed, "voo direto")
@@ -1732,11 +1794,11 @@ local function buildChestRoute(origin, finalPosition)
     -- A transicao curta e mais rapida resolve a sensacao de "escalar" lentamente.
     -- O teto dinamico ainda recua se o servidor corrigir a posicao.
     local clearance = math.max(origin.Y, finalPosition.Y, Config.SafeTravelHeight) + 3
-    local transitionDistance = math.min(WATER_TRANSITION_DISTANCE, horizontalDistance * 0.12)
-    local transitionRatio = math.clamp(transitionDistance / horizontalDistance, 0.03, 0.12)
+    local transitionDistance = math.min(WATER_TRANSITION_DISTANCE, horizontalDistance * 0.24)
+    local transitionRatio = math.clamp(transitionDistance / horizontalDistance, 0.08, 0.24)
     local transitionSpeed = math.min(
         speed * WATER_TRANSITION_SPEED_MULTIPLIER,
-        (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) + 30,
+        (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) + 50,
         WATER_TRANSITION_MAX_SPEED
     )
     local takeoffBase = origin:Lerp(finalPosition, transitionRatio)
