@@ -1,7 +1,7 @@
 --!nolint DeprecatedApi
 --[[
     ================================================================================
-    AUTO CHEST & SERVER HOP (v2.7.4)
+    AUTO CHEST & SERVER HOP (v2.7.5)
     Suporte: Sea 1 (2753915549) | Sea 2 (4442272183) | Sea 3 (7449423635)
     ================================================================================
     PROJETO / IDEIA CENTRAL:
@@ -27,16 +27,17 @@
 ]]
 
 local SCRIPT_NAME = "Auto Chest"
-local SCRIPT_VERSION = "2.7.4"
-local SCRIPT_BUILD = "2026-10-06 / hybrid-fast-safe-flight"
+local SCRIPT_VERSION = "2.7.5"
+local SCRIPT_BUILD = "2026-10-06 / faster-water-sea2-safe-hop"
 local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/victorcxzk/Script/main/AutoChest.lua"
 local RAW_SCRIPT_FALLBACK_URL = "https://github.com/victorcxzk/Script/raw/main/AutoChest.lua"
 local SETTINGS_SCHEMA = 5
 
+local SEA_2_PLACE_ID = 4442272183
 local SEA_PROFILES = {
-    [2753915549] = {BaseSpeed = 180, MaxSpeed = 205, SegmentDistance = 220, FallbackSpeed = 140},
-    [4442272183] = {BaseSpeed = 205, MaxSpeed = 225, SegmentDistance = 260, FallbackSpeed = 150},
-    [7449423635] = {BaseSpeed = 185, MaxSpeed = 210, SegmentDistance = 230, FallbackSpeed = 140},
+    [2753915549] = {BaseSpeed = 200, MaxSpeed = 230, SegmentDistance = 250, FallbackSpeed = 150},
+    [SEA_2_PLACE_ID] = {BaseSpeed = 235, MaxSpeed = 270, SegmentDistance = 290, FallbackSpeed = 175},
+    [7449423635] = {BaseSpeed = 210, MaxSpeed = 245, SegmentDistance = 260, FallbackSpeed = 155},
 }
 local SEA_PROFILE = SEA_PROFILES[game.PlaceId] or SEA_PROFILES[2753915549]
 local MAX_ADAPTIVE_TRAVEL_SPEED = SEA_PROFILE.MaxSpeed
@@ -46,6 +47,9 @@ local STABLE_SEGMENTS_TO_RECOVER = 4
 local SPEED_RECOVERY_SEGMENTS = 12
 local SAFE_ROUTE_MIN_HORIZONTAL = 320
 local CHEST_STAGING_HEIGHT = 4.5
+local WATER_TRANSITION_SPEED_MULTIPLIER = 1.28
+local WATER_TRANSITION_MAX_SPEED = 300
+local WATER_TRANSITION_DISTANCE = 46
 local UPDATE_CHECK_INTERVAL = 60
 local AUTO_TEAM_NAME = "Pirates"
 local TEAM_SELECTION_TIMEOUT = 25
@@ -70,7 +74,7 @@ local Config = {
 
     TweenSpeed = SEA_PROFILE.BaseSpeed, -- Rapido, mas com limite dinamico por servidor
     MovementTimeout = 90,           -- Prazo por trecho; viagens longas sao divididas em trechos
-    ContactSpeed = game.PlaceId == 4442272183 and 34 or 30, -- Apenas os ultimos studs ficam controlados
+    ContactSpeed = game.PlaceId == SEA_2_PLACE_ID and 36 or 32, -- Apenas os ultimos studs ficam controlados
     ArrivalTolerance = 5,           -- Distancia maxima para considerar que chegou ao bau
 
     Noclip = true,                  -- Atravessa paredes durante o deslocamento
@@ -1228,7 +1232,8 @@ local function getAdaptiveTravelSpeed(distance)
     -- O teto cai automaticamente quando o servidor corrige o personagem e
     -- recupera aos poucos depois de varios checkpoints estaveis.
     local boostRatio = math.clamp((distance - 250) / 1750, 0, 1)
-    return math.min(Config.TweenSpeed + boostRatio * 20,
+    local availableBoost = math.max(0, MAX_ADAPTIVE_TRAVEL_SPEED - Config.TweenSpeed)
+    return math.min(Config.TweenSpeed + boostRatio * availableBoost,
         State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED)
 end
 
@@ -1617,7 +1622,7 @@ local function moveToPosition(targetCFrame, speed, context)
                     State.SpeedRecoverySegments = 0
                     if isTravelSegment then
                         State.DynamicTravelCap = math.max(RUBBERBAND_FALLBACK_SPEED,
-                            math.min(State.DynamicTravelCap, effectiveSpeed - 15))
+                            (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) - 15)
                     end
                     addLog("WARN", string.format(
                         "Correcao persistente do servidor (%.1f studs); repetindo trecho a %.0f/s",
@@ -1638,7 +1643,7 @@ local function moveToPosition(targetCFrame, speed, context)
                     State.SpeedRecoverySegments = 0
                     if isTravelSegment then
                         State.DynamicTravelCap = math.max(RUBBERBAND_FALLBACK_SPEED,
-                            math.min(State.DynamicTravelCap, effectiveSpeed - 15))
+                            (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) - 15)
                     end
                     addLog("WARN", string.format("Tween terminou fora do alvo: %.1f studs | Y=%.1f HP=%.1f",
                         remaining, root.Position.Y, humanoid.Health))
@@ -1724,17 +1729,24 @@ local function buildChestRoute(origin, finalPosition)
         return segments
     end
 
-    local clearance = math.max(origin.Y, finalPosition.Y, Config.SafeTravelHeight) + 8
-    local transitionDistance = math.min(80, horizontalDistance * 0.20)
-    local transitionRatio = math.clamp(transitionDistance / horizontalDistance, 0.05, 0.25)
+    -- A transicao curta e mais rapida resolve a sensacao de "escalar" lentamente.
+    -- O teto dinamico ainda recua se o servidor corrigir a posicao.
+    local clearance = math.max(origin.Y, finalPosition.Y, Config.SafeTravelHeight) + 3
+    local transitionDistance = math.min(WATER_TRANSITION_DISTANCE, horizontalDistance * 0.12)
+    local transitionRatio = math.clamp(transitionDistance / horizontalDistance, 0.03, 0.12)
+    local transitionSpeed = math.min(
+        speed * WATER_TRANSITION_SPEED_MULTIPLIER,
+        (State.DynamicTravelCap or MAX_ADAPTIVE_TRAVEL_SPEED) + 30,
+        WATER_TRANSITION_MAX_SPEED
+    )
     local takeoffBase = origin:Lerp(finalPosition, transitionRatio)
     local landingBase = origin:Lerp(finalPosition, 1 - transitionRatio)
     local takeoff = Vector3.new(takeoffBase.X, clearance, takeoffBase.Z)
     local landing = Vector3.new(landingBase.X, clearance, landingBase.Z)
 
-    local previous = appendSegmentedRoute(segments, origin, takeoff, speed, "subida diagonal")
+    local previous = appendSegmentedRoute(segments, origin, takeoff, transitionSpeed, "subida diagonal rapida")
     previous = appendSegmentedRoute(segments, previous, landing, speed, "travessia segura")
-    appendSegmentedRoute(segments, previous, finalPosition, speed, "descida diagonal")
+    appendSegmentedRoute(segments, previous, finalPosition, transitionSpeed, "descida diagonal rapida")
     return segments
 end
 
@@ -2090,6 +2102,13 @@ local function fetchPublicServerCandidates(placeId, currentJob, sortOrder)
     return candidates, #unvisited == 0 and #recycled > 0, lastError, pagesRead, serversSeen, transportUsed
 end
 
+local function shouldUseMatchmaking(placeId, hopAttempt)
+    local sea2MatchmakingFirst = placeId == SEA_2_PLACE_ID
+    local oddAttempt = hopAttempt % 2 == 1
+    return (sea2MatchmakingFirst and oddAttempt)
+        or (not sea2MatchmakingFirst and not oddAttempt), sea2MatchmakingFirst
+end
+
 doServerHop = function(reason, isRetry)
     if State.Unloaded or State.IsHopping then return end
 
@@ -2190,9 +2209,10 @@ doServerHop = function(reason, isRetry)
     local placeId = game.PlaceId
     local currentJob = game.JobId
 
-    -- Alterna JobId publico com matchmaking nos retries. Isso mantem a busca
-    -- rapida por servidor vazio sem repetir erro 773 em todas as tentativas.
-    local useMatchmaking = isRetry and State.HopAttempts % 2 == 0
+    -- A Sea 2 comeca pelo matchmaking oficial: TeleportToPlaceInstance e o
+    -- caminho que mais costuma devolver 773 nesse mapa. Nos retries alterna os
+    -- dois metodos para nunca ficar preso em uma unica falha.
+    local useMatchmaking, sea2MatchmakingFirst = shouldUseMatchmaking(placeId, State.HopAttempts)
     local candidates, recycledVisited, fetchError, pagesRead, serversSeen, transportUsed = {}, false, nil, 0, 0, nil
     if not useMatchmaking then
         candidates, recycledVisited, fetchError, pagesRead, serversSeen, transportUsed =
@@ -2214,10 +2234,13 @@ doServerHop = function(reason, isRetry)
             TeleportService:TeleportToPlaceInstance(placeId, chosen, LocalPlayer)
         end)
     else
-        -- Fallback e retries pares usam matchmaking para contornar 769/773 e
-        -- executores cuja API HTTP nao responde.
+        -- O matchmaking contorna 769/773 e executores cuja API HTTP nao responde.
         if useMatchmaking then
-            addLog("HOP", "Retry alternado pelo matchmaking do Roblox")
+            if sea2MatchmakingFirst and State.HopAttempts == 1 then
+                addLog("HOP", "Sea 2: primeiro hop pelo matchmaking oficial do Roblox")
+            else
+                addLog("HOP", "Retry alternado pelo matchmaking do Roblox")
+            end
         else
             addLog("WARN", string.format(
                 "Sem JobId pela API (paginas=%d vistos=%d erro=%s); usando fallback de matchmaking",
